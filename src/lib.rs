@@ -12,7 +12,7 @@ use jni::{
     sys::{self, jint, jobject},
     JNIEnv, JavaVM,
 };
-use keycodes::{android_key_event_to_ruffle_key_descriptor, key_tag_to_key_descriptor};
+use keycodes::{android_key_event_to_ruffle_key_descriptor, key_tag_to_key_descriptor, keycode_to_key_descriptor};
 use std::any::Any;
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
@@ -574,6 +574,40 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_keyup(
     let event_loop: MutexGuard<Sender<RuffleEvent>> =
         env.get_rust_field(this, "eventLoopHandle").unwrap();
     if let Some(desc) = key_tag_to_key_descriptor(&tag) {
+        let _ = event_loop.send(RuffleEvent::VirtualKeyEvent {
+            down: false,
+            key_descriptor: desc,
+        });
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_keydownByCode(
+    mut env: JNIEnv,
+    this: JObject,
+    keycode: jint,
+) {
+    let event_loop: MutexGuard<Sender<RuffleEvent>> =
+        env.get_rust_field(this, "eventLoopHandle").unwrap();
+    if let Some(desc) = keycode_to_key_descriptor(keycode) {
+        let _ = event_loop.send(RuffleEvent::VirtualKeyEvent {
+            down: true,
+            key_descriptor: desc,
+        });
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_keyupByCode(
+    mut env: JNIEnv,
+    this: JObject,
+    keycode: jint,
+) {
+    let event_loop: MutexGuard<Sender<RuffleEvent>> =
+        env.get_rust_field(this, "eventLoopHandle").unwrap();
+    if let Some(desc) = keycode_to_key_descriptor(keycode) {
         let _ = event_loop.send(RuffleEvent::VirtualKeyEvent {
             down: false,
             key_descriptor: desc,
