@@ -43,15 +43,11 @@ android {
     }
 
     signingConfigs {
-        val keyFile = file("androidkey.jks")
-        val storePasswordVal = System.getenv("SIGNING_STORE_PASSWORD")
-        if (keyFile.exists() && storePasswordVal != null && storePasswordVal.isNotEmpty()) {
-            create("release") {
-                storeFile = keyFile
-                storePassword = storePasswordVal
-                keyAlias = System.getenv("SIGNING_KEY_ALIAS")
-                keyPassword = System.getenv("SIGNING_KEY_PASSWORD")
-            }
+        create("release") {
+            storeFile = file("skyksit.keystore")
+            storePassword = "***PURGED***"
+            keyAlias = "skyksit"
+            keyPassword = "***PURGED***"
         }
     }
 

@@ -268,7 +268,6 @@ class PlayerActivity : GameActivity() {
 
     companion object {
         init {
-            // load the native activity
             System.loadLibrary("ruffle_android")
         }
 
