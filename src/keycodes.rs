@@ -500,6 +500,12 @@ pub fn keycode_to_key_descriptor(keycode: i32) -> Option<KeyDescriptor> {
         160 => (LogicalKey::Named(NamedKey::Enter), KeyLocation::Numpad), // KEYCODE_NUMPAD_ENTER
         161 => (LogicalKey::Character('='), KeyLocation::Numpad),  // KEYCODE_NUMPAD_EQUALS
         
+        // System Navigation (gesture navigation) - map to arrow keys
+        280 => (LogicalKey::Named(NamedKey::ArrowUp), KeyLocation::Standard),    // KEYCODE_SYSTEM_NAVIGATION_UP
+        281 => (LogicalKey::Named(NamedKey::ArrowDown), KeyLocation::Standard),  // KEYCODE_SYSTEM_NAVIGATION_DOWN
+        282 => (LogicalKey::Named(NamedKey::ArrowLeft), KeyLocation::Standard),  // KEYCODE_SYSTEM_NAVIGATION_LEFT
+        283 => (LogicalKey::Named(NamedKey::ArrowRight), KeyLocation::Standard), // KEYCODE_SYSTEM_NAVIGATION_RIGHT
+        
         _ => return None,
     };
 
