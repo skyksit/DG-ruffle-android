@@ -355,7 +355,7 @@ async fn run(app: AndroidApp) {
                                 } else {
                                     player_lock.fetch_root_movie(url, Vec::new(), Box::new(|_| {
                                         // Notify Java that content is loaded and ready when fetched
-                                        let (jvm, activity) = get_jvm().unwrap();
+                                        let (_jvm, _activity) = get_jvm().unwrap();
                                         if let Ok((jvm, activity)) = get_jvm() {
                                             if let Ok(mut env) = jvm.attach_current_thread() {
                                                 JavaInterface::on_content_ready(&mut env, &activity);
