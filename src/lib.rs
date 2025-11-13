@@ -78,6 +78,9 @@ impl PollRequester for EventSender {
 // Static flag to track whether we've notified Java that content is ready
 static CONTENT_READY_NOTIFIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+// Store the last mouse position for virtual mouse events
+static LAST_MOUSE_POSITION: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
+
 #[tokio::main]
 async fn run(app: AndroidApp) {
     let mut last_frame_time = Instant::now();
@@ -341,6 +344,12 @@ async fn run(app: AndroidApp) {
                                         let view_size = get_view_size().unwrap();
                                         x = x * window.width() as f64 / view_size.0 as f64;
                                         y = y * window.height() as f64 / view_size.1 as f64;
+                                        
+                                        // Update last mouse position for virtual mouse events
+                                        if let Ok(mut pos) = LAST_MOUSE_POSITION.lock() {
+                                            *pos = (x, y);
+                                        }
+                                        
                                         let ruffle_event = match event.action() {
                                             MotionAction::Down | MotionAction::PointerDown | MotionAction::ButtonPress => {
                                                 PlayerEvent::MouseDown {
@@ -457,8 +466,11 @@ async fn run(app: AndroidApp) {
                     }
                 }
             }
-            Ok(RuffleEvent::VirtualMouseEvent { down, x, y, button }) => {
+            Ok(RuffleEvent::VirtualMouseEvent { down, button }) => {
                 if let Some(player) = playerbox.as_ref() {
+                    // Get the last mouse position
+                    let (x, y) = LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    
                     let event = if down {
                         PlayerEvent::MouseDown {
                             x,
@@ -650,16 +662,12 @@ fn button_code_to_mouse_button(button_code: jint) -> MouseButton {
 pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_mousedown(
     mut env: JNIEnv,
     this: JObject,
-    x: sys::jdouble,
-    y: sys::jdouble,
     button_code: jint,
 ) {
     let event_loop: MutexGuard<Sender<RuffleEvent>> =
         env.get_rust_field(this, "eventLoopHandle").unwrap();
     let _ = event_loop.send(RuffleEvent::VirtualMouseEvent {
         down: true,
-        x: x as f64,
-        y: y as f64,
         button: button_code_to_mouse_button(button_code),
     });
 }
@@ -669,16 +677,12 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_mousedown(
 pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_mouseup(
     mut env: JNIEnv,
     this: JObject,
-    x: sys::jdouble,
-    y: sys::jdouble,
     button_code: jint,
 ) {
     let event_loop: MutexGuard<Sender<RuffleEvent>> =
         env.get_rust_field(this, "eventLoopHandle").unwrap();
     let _ = event_loop.send(RuffleEvent::VirtualMouseEvent {
         down: false,
-        x: x as f64,
-        y: y as f64,
         button: button_code_to_mouse_button(button_code),
     });
 }

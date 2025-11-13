@@ -13,8 +13,6 @@ pub enum RuffleEvent {
     },
     VirtualMouseEvent {
         down: bool,
-        x: f64,
-        y: f64,
         button: MouseButton,
     },
     RunContextMenuCallback(usize),

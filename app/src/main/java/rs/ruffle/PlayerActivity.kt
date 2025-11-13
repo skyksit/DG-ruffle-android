@@ -96,8 +96,8 @@ class PlayerActivity : GameActivity() {
 
     private external fun keydown(keyTag: String)
     private external fun keyup(keyTag: String)
-    private external fun mousedown(x: Double, y: Double, button: Int)
-    private external fun mouseup(x: Double, y: Double, button: Int)
+    private external fun mousedown(button: Int)
+    private external fun mouseup(button: Int)
     private external fun requestContextMenu()
     private external fun runContextMenuCallback(index: Int)
     private external fun clearContextMenu()
