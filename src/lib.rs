@@ -88,6 +88,9 @@ static MOUSE_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::ne
 static TOUCH_START: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 static MOUSE_POS_AT_TOUCH_START: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 
+// Touch click enabled: true = mouse click events on touch, false = only mouse move
+static TOUCH_CLICK_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 #[tokio::main]
 async fn run(app: AndroidApp) {
     let mut last_frame_time = Instant::now();
@@ -405,20 +408,31 @@ async fn run(app: AndroidApp) {
                                             *pos = (mouse_x, mouse_y);
                                         }
                                         
+                                        // Check if touch click is enabled
+                                        let touch_click_enabled = TOUCH_CLICK_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+                                        
                                         let ruffle_event = match event.action() {
                                             MotionAction::Down | MotionAction::PointerDown | MotionAction::ButtonPress => {
-                                                PlayerEvent::MouseDown {
-                                                    x: mouse_x,
-                                                    y: mouse_y,
-                                                    button: MouseButton::Left, // TODO
-                                                    index: None, // TODO
+                                                if touch_click_enabled {
+                                                    PlayerEvent::MouseDown {
+                                                        x: mouse_x,
+                                                        y: mouse_y,
+                                                        button: MouseButton::Left, // TODO
+                                                        index: None, // TODO
+                                                    }
+                                                } else {
+                                                    PlayerEvent::MouseMove { x: mouse_x, y: mouse_y }
                                                 }
                                             }
                                             MotionAction::Up | MotionAction::PointerUp | MotionAction::ButtonRelease => {
-                                                PlayerEvent::MouseUp {
-                                                    x: mouse_x,
-                                                    y: mouse_y,
-                                                    button: MouseButton::Left, // TODO
+                                                if touch_click_enabled {
+                                                    PlayerEvent::MouseUp {
+                                                        x: mouse_x,
+                                                        y: mouse_y,
+                                                        button: MouseButton::Left, // TODO
+                                                    }
+                                                } else {
+                                                    PlayerEvent::MouseMove { x: mouse_x, y: mouse_y }
                                                 }
                                             }
                                             MotionAction::Move => PlayerEvent::MouseMove { x: mouse_x, y: mouse_y },
@@ -845,6 +859,19 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_setMouseMode(
     // mode: 0 = Direct Touch, 1 = Relative Swipe
     MOUSE_MODE.store(mode as u8, std::sync::atomic::Ordering::Relaxed);
     log::info!("Mouse mode changed to: {}", if mode == 0 { "Direct Touch" } else { "Relative Swipe" });
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_setTouchClickEnabled(
+    _env: JNIEnv,
+    _this: JObject,
+    enabled: jint,
+) {
+    // enabled: 0 = disabled (only mouse move), 1 = enabled (mouse click on touch)
+    let is_enabled = enabled != 0;
+    TOUCH_CLICK_ENABLED.store(is_enabled, std::sync::atomic::Ordering::Relaxed);
+    log::info!("Touch click events: {}", if is_enabled { "enabled" } else { "disabled" });
 }
 
 #[no_mangle]
