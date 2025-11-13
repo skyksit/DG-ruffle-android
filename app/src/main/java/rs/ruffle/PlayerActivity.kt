@@ -101,6 +101,10 @@ class PlayerActivity : GameActivity() {
     private external fun requestContextMenu()
     private external fun runContextMenuCallback(index: Int)
     private external fun clearContextMenu()
+    private external fun setMouseMode(mode: Int)
+    
+    // Mouse mode: 0 = Direct Touch, 1 = Relative Swipe
+    private var mouseMode = 0
 
     @Suppress("unused")
     // Used by Rust
@@ -196,6 +200,16 @@ class PlayerActivity : GameActivity() {
         }
         layout.findViewById<View>(R.id.button_cm)
             .setOnClickListener { requestContextMenu() }
+        
+        // Mouse mode toggle button
+        val mouseModeButton = layout.findViewById<Button>(R.id.button_mouse_mode)
+        mouseModeButton.setOnClickListener {
+            mouseMode = if (mouseMode == 0) 1 else 0
+            setMouseMode(mouseMode)
+            mouseModeButton.text = if (mouseMode == 0) "🖱" else "👆"
+            Log.i("ruffle", "Mouse mode changed to: ${if (mouseMode == 0) "Direct Touch" else "Relative Swipe"}")
+        }
+        
         layout.requestLayout()
         layout.requestFocus()
         mSurfaceView.holder.addCallback(this)

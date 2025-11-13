@@ -427,6 +427,13 @@
             android:tag="cm"
             android:text="▤" />
 
+        <Button
+            android:id="@+id/button_mouse_mode"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:tag="mouse_mode"
+            android:text="🖱" />
+
     </LinearLayout>
 
 </androidx.constraintlayout.widget.ConstraintLayout>
