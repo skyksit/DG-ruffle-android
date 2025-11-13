@@ -130,6 +130,13 @@ static CONTENT_READY_NOTIFIED: std::sync::atomic::AtomicBool = std::sync::atomic
 // Store the last mouse position for virtual mouse events
 static LAST_MOUSE_POSITION: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 
+// Mouse mode: 0 = Direct Touch (absolute), 1 = Relative Swipe
+static MOUSE_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+// Store touch start position and mouse position at touch start for relative mode
+static TOUCH_START: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+static MOUSE_POS_AT_TOUCH_START: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
+
 #[tokio::main]
 async fn run(app: AndroidApp) {
     let mut last_frame_time = Instant::now();
@@ -392,34 +399,82 @@ async fn run(app: AndroidApp) {
                                         let pointer = event.pointer_index();
                                         let pointer = event.pointer_at_index(pointer);
                                         let coords: (i32, i32) = get_loc_in_window();
-                                        let mut x = pointer.x() as f64 - coords.0 as f64;
-                                        let mut y = pointer.y() as f64 - coords.1 as f64;
+                                        let touch_x = pointer.x() as f64 - coords.0 as f64;
+                                        let touch_y = pointer.y() as f64 - coords.1 as f64;
                                         let view_size = get_view_size().unwrap();
-                                        x = x * window.width() as f64 / view_size.0 as f64;
-                                        y = y * window.height() as f64 / view_size.1 as f64;
+                                        let scaled_touch_x = touch_x * window.width() as f64 / view_size.0 as f64;
+                                        let scaled_touch_y = touch_y * window.height() as f64 / view_size.1 as f64;
                                         
-                                        // Update last mouse position for virtual mouse events
+                                        // Check mouse mode: 0 = Direct Touch, 1 = Relative Swipe
+                                        let mouse_mode = MOUSE_MODE.load(std::sync::atomic::Ordering::Relaxed);
+                                        
+                                        let (mouse_x, mouse_y) = if mouse_mode == 0 {
+                                            // Direct Touch mode: mouse position = touch position
+                                            (scaled_touch_x, scaled_touch_y)
+                                        } else {
+                                            // Relative Swipe mode: calculate relative movement
+                                            match event.action() {
+                                                MotionAction::Down | MotionAction::PointerDown | MotionAction::ButtonPress => {
+                                                    // Store touch start position and current mouse position
+                                                    if let Ok(mut touch_start) = TOUCH_START.lock() {
+                                                        *touch_start = Some((scaled_touch_x, scaled_touch_y));
+                                                    }
+                                                    if let Ok(mut mouse_at_start) = MOUSE_POS_AT_TOUCH_START.lock() {
+                                                        if let Ok(last_pos) = LAST_MOUSE_POSITION.lock() {
+                                                            *mouse_at_start = *last_pos;
+                                                        }
+                                                    }
+                                                    // Return current mouse position (no movement on touch down)
+                                                    LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone()
+                                                }
+                                                MotionAction::Move => {
+                                                    // Calculate relative movement from touch start
+                                                    let touch_start = TOUCH_START.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                                                    if let Some((start_x, start_y)) = touch_start {
+                                                        let delta_x = scaled_touch_x - start_x;
+                                                        let delta_y = scaled_touch_y - start_y;
+                                                        let mouse_at_start = MOUSE_POS_AT_TOUCH_START.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                                                        let new_x = (mouse_at_start.0 + delta_x).max(0.0).min(window.width() as f64);
+                                                        let new_y = (mouse_at_start.1 + delta_y).max(0.0).min(window.height() as f64);
+                                                        (new_x, new_y)
+                                                    } else {
+                                                        LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone()
+                                                    }
+                                                }
+                                                MotionAction::Up | MotionAction::PointerUp | MotionAction::ButtonRelease => {
+                                                    // Clear touch start on release
+                                                    if let Ok(mut touch_start) = TOUCH_START.lock() {
+                                                        *touch_start = None;
+                                                    }
+                                                    // Return current mouse position
+                                                    LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone()
+                                                }
+                                                _ => LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone()
+                                            }
+                                        };
+                                        
+                                        // Update last mouse position
                                         if let Ok(mut pos) = LAST_MOUSE_POSITION.lock() {
-                                            *pos = (x, y);
+                                            *pos = (mouse_x, mouse_y);
                                         }
                                         
                                         let ruffle_event = match event.action() {
                                             MotionAction::Down | MotionAction::PointerDown | MotionAction::ButtonPress => {
                                                 PlayerEvent::MouseDown {
-                                                    x,
-                                                    y,
+                                                    x: mouse_x,
+                                                    y: mouse_y,
                                                     button: MouseButton::Left, // TODO
                                                     index: None, // TODO
                                                 }
                                             }
                                             MotionAction::Up | MotionAction::PointerUp | MotionAction::ButtonRelease => {
                                                 PlayerEvent::MouseUp {
-                                                    x,
-                                                    y,
+                                                    x: mouse_x,
+                                                    y: mouse_y,
                                                     button: MouseButton::Left, // TODO
                                                 }
                                             }
-                                            MotionAction::Move => PlayerEvent::MouseMove { x, y },
+                                            MotionAction::Move => PlayerEvent::MouseMove { x: mouse_x, y: mouse_y },
                                             _ => return InputStatus::Unhandled,
                                         };
 
@@ -836,6 +891,18 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_clearContextMenu(
     let event_loop: MutexGuard<Sender<RuffleEvent>> =
         env.get_rust_field(this, "eventLoopHandle").unwrap();
     let _ = event_loop.send(RuffleEvent::ClearContextMenu);
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_setMouseMode(
+    _env: JNIEnv,
+    _this: JObject,
+    mode: jint,
+) {
+    // mode: 0 = Direct Touch, 1 = Relative Swipe
+    MOUSE_MODE.store(mode as u8, std::sync::atomic::Ordering::Relaxed);
+    log::info!("Mouse mode changed to: {}", if mode == 0 { "Direct Touch" } else { "Relative Swipe" });
 }
 
 #[no_mangle]
