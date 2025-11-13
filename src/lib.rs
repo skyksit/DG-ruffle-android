@@ -464,6 +464,13 @@ async fn run(app: AndroidApp) {
                             player.player.lock().unwrap().handle_event(event);
                         }
                     }
+                    
+                    // 키 이벤트 후 MouseMove를 보내서 마우스 모드 유지
+                    // 이렇게 하면 키보드 입력 후에도 마우스 커서가 사라지지 않음
+                    let (x, y) = LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    if x != 0.0 || y != 0.0 {
+                        player.player.lock().unwrap().handle_event(PlayerEvent::MouseMove { x, y });
+                    }
                 }
             }
             Ok(RuffleEvent::VirtualMouseEvent { down, button }) => {
@@ -471,6 +478,10 @@ async fn run(app: AndroidApp) {
                     // Get the last mouse position
                     let (x, y) = LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     
+                    // 먼저 MouseMove 이벤트를 보내서 마우스가 그 위치에 있다고 알림
+                    player.player.lock().unwrap().handle_event(PlayerEvent::MouseMove { x, y });
+                    
+                    // 그 다음 MouseDown 또는 MouseUp 이벤트 보냄
                     let event = if down {
                         PlayerEvent::MouseDown {
                             x,
@@ -486,6 +497,9 @@ async fn run(app: AndroidApp) {
                         }
                     };
                     player.player.lock().unwrap().handle_event(event);
+
+                    // click 후에도 마우스가 그 위치에 있다고 알림
+                    player.player.lock().unwrap().handle_event(PlayerEvent::MouseMove { x, y });
                 }
             }
             Ok(RuffleEvent::RunContextMenuCallback(index)) => {
@@ -495,11 +509,23 @@ async fn run(app: AndroidApp) {
                         .lock()
                         .unwrap()
                         .run_context_menu_callback(index);
+                    
+                    // 컨텍스트 메뉴 선택 후에도 마우스 모드 유지
+                    let (x, y) = LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    if x != 0.0 || y != 0.0 {
+                        player.player.lock().unwrap().handle_event(PlayerEvent::MouseMove { x, y });
+                    }
                 }
             }
             Ok(RuffleEvent::ClearContextMenu) => {
                 if let Some(player) = playerbox.as_ref() {
                     player.player.lock().unwrap().clear_custom_menu_items();
+                    
+                    // 컨텍스트 메뉴 닫기 후에도 마우스 모드 유지
+                    let (x, y) = LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    if x != 0.0 || y != 0.0 {
+                        player.player.lock().unwrap().handle_event(PlayerEvent::MouseMove { x, y });
+                    }
                 }
             }
             Ok(RuffleEvent::RequestContextMenu) => {
@@ -509,6 +535,12 @@ async fn run(app: AndroidApp) {
                     let (jvm, activity) = get_jvm().unwrap();
                     let mut env = jvm.attach_current_thread().unwrap();
                     JavaInterface::show_context_menu(&mut env, &activity, &items);
+                    
+                    // 컨텍스트 메뉴 요청 후에도 마우스 모드 유지
+                    let (x, y) = LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    if x != 0.0 || y != 0.0 {
+                        player.player.lock().unwrap().handle_event(PlayerEvent::MouseMove { x, y });
+                    }
                 }
             }
         }
