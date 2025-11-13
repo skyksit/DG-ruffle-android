@@ -446,6 +446,12 @@ async fn run(app: AndroidApp) {
                 key_descriptor,
             }) => {
                 if let Some(player) = playerbox.as_ref() {
+                    // 키 이벤트 전에 MouseMove를 보내서 마우스 위치 확인
+                    let (x, y) = LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    if x != 0.0 || y != 0.0 {
+                        player.player.lock().unwrap().handle_event(PlayerEvent::MouseMove { x, y });
+                    }
+                    
                     let event = if down {
                         PlayerEvent::KeyDown {
                             key: key_descriptor,
@@ -465,12 +471,13 @@ async fn run(app: AndroidApp) {
                         }
                     }
                     
-                    // 키 이벤트 후 MouseMove를 보내서 마우스 모드 유지
-                    // 이렇게 하면 키보드 입력 후에도 마우스 커서가 사라지지 않음
-                    let (x, y) = LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    // 키 이벤트 후에도 MouseMove를 보내서 마우스 모드 유지
+                    // 특히 up 이벤트 후에 중요!
                     if x != 0.0 || y != 0.0 {
                         player.player.lock().unwrap().handle_event(PlayerEvent::MouseMove { x, y });
                     }
+                    
+                    needs_redraw = true;
                 }
             }
             Ok(RuffleEvent::VirtualMouseEvent { down, button }) => {
@@ -478,28 +485,33 @@ async fn run(app: AndroidApp) {
                     // Get the last mouse position
                     let (x, y) = LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     
-                    // 먼저 MouseMove 이벤트를 보내서 마우스가 그 위치에 있다고 알림
-                    player.player.lock().unwrap().handle_event(PlayerEvent::MouseMove { x, y });
-                    
-                    // 그 다음 MouseDown 또는 MouseUp 이벤트 보냄
-                    let event = if down {
-                        PlayerEvent::MouseDown {
-                            x,
-                            y,
-                            button,
-                            index: None,
-                        }
-                    } else {
-                        PlayerEvent::MouseUp {
-                            x,
-                            y,
-                            button,
-                        }
-                    };
-                    player.player.lock().unwrap().handle_event(event);
+                    if x != 0.0 || y != 0.0 {
+                        // 이벤트 전에 MouseMove를 보내서 마우스 위치 확인
+                        player.player.lock().unwrap().handle_event(PlayerEvent::MouseMove { x, y });
+                        
+                        // MouseDown 또는 MouseUp 이벤트 보냄
+                        let event = if down {
+                            PlayerEvent::MouseDown {
+                                x,
+                                y,
+                                button,
+                                index: None,
+                            }
+                        } else {
+                            PlayerEvent::MouseUp {
+                                x,
+                                y,
+                                button,
+                            }
+                        };
+                        player.player.lock().unwrap().handle_event(event);
 
-                    // click 후에도 마우스가 그 위치에 있다고 알림
-                    player.player.lock().unwrap().handle_event(PlayerEvent::MouseMove { x, y });
+                        // 이벤트 후에도 MouseMove를 보내서 마우스 모드 유지
+                        // 특히 up 이벤트 후에 중요!
+                        player.player.lock().unwrap().handle_event(PlayerEvent::MouseMove { x, y });
+                    }
+                    
+                    needs_redraw = true;
                 }
             }
             Ok(RuffleEvent::RunContextMenuCallback(index)) => {
@@ -515,6 +527,8 @@ async fn run(app: AndroidApp) {
                     if x != 0.0 || y != 0.0 {
                         player.player.lock().unwrap().handle_event(PlayerEvent::MouseMove { x, y });
                     }
+                    
+                    needs_redraw = true;
                 }
             }
             Ok(RuffleEvent::ClearContextMenu) => {
@@ -526,6 +540,8 @@ async fn run(app: AndroidApp) {
                     if x != 0.0 || y != 0.0 {
                         player.player.lock().unwrap().handle_event(PlayerEvent::MouseMove { x, y });
                     }
+                    
+                    needs_redraw = true;
                 }
             }
             Ok(RuffleEvent::RequestContextMenu) => {
@@ -541,6 +557,8 @@ async fn run(app: AndroidApp) {
                     if x != 0.0 || y != 0.0 {
                         player.player.lock().unwrap().handle_event(PlayerEvent::MouseMove { x, y });
                     }
+                    
+                    needs_redraw = true;
                 }
             }
         }
