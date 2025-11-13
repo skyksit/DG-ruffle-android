@@ -183,7 +183,7 @@ class PlayerActivity : GameActivity() {
                 if (motionEvent.action == MotionEvent.ACTION_DOWN) keydown(tag)
                 if (motionEvent.action == MotionEvent.ACTION_UP) keyup(tag)
                 view.performClick()
-                false
+                true  // 이벤트를 소비하여 게임 화면으로 전파되지 않도록 함
             }
         }
         layout.findViewById<View>(R.id.button_kb).setOnClickListener {
