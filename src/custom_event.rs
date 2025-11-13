@@ -1,6 +1,6 @@
 //! Custom event type for Ruffle on Android
 
-use ruffle_core::events::KeyDescriptor;
+use ruffle_core::events::{KeyDescriptor, MouseButton};
 
 use crate::PlayerRunnable;
 
@@ -11,6 +11,12 @@ pub enum RuffleEvent {
     VirtualKeyEvent {
         down: bool,
         key_descriptor: KeyDescriptor,
+    },
+    VirtualMouseEvent {
+        down: bool,
+        x: f64,
+        y: f64,
+        button: MouseButton,
     },
     RunContextMenuCallback(usize),
     ClearContextMenu,

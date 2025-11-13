@@ -515,6 +515,25 @@ async fn run(app: AndroidApp) {
                     }
                 }
             }
+            Ok(RuffleEvent::VirtualMouseEvent { down, x, y, button }) => {
+                if let Some(player) = playerbox.as_ref() {
+                    let event = if down {
+                        PlayerEvent::MouseDown {
+                            x,
+                            y,
+                            button,
+                            index: None,
+                        }
+                    } else {
+                        PlayerEvent::MouseUp {
+                            x,
+                            y,
+                            button,
+                        }
+                    };
+                    player.player.lock().unwrap().handle_event(event);
+                }
+            }
             Ok(RuffleEvent::RunContextMenuCallback(index)) => {
                 if let Some(player) = playerbox.as_ref() {
                     player
@@ -671,6 +690,55 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_keyupByCode(
             key_descriptor: desc,
         });
     }
+}
+
+/// Convert button code to MouseButton
+/// 0 = Left, 1 = Right, 2 = Middle
+fn button_code_to_mouse_button(button_code: jint) -> MouseButton {
+    match button_code {
+        0 => MouseButton::Left,
+        1 => MouseButton::Right,
+        2 => MouseButton::Middle,
+        _ => MouseButton::Left, // Default to left button
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_mousedown(
+    mut env: JNIEnv,
+    this: JObject,
+    x: sys::jdouble,
+    y: sys::jdouble,
+    button_code: jint,
+) {
+    let event_loop: MutexGuard<Sender<RuffleEvent>> =
+        env.get_rust_field(this, "eventLoopHandle").unwrap();
+    let _ = event_loop.send(RuffleEvent::VirtualMouseEvent {
+        down: true,
+        x: x as f64,
+        y: y as f64,
+        button: button_code_to_mouse_button(button_code),
+    });
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_mouseup(
+    mut env: JNIEnv,
+    this: JObject,
+    x: sys::jdouble,
+    y: sys::jdouble,
+    button_code: jint,
+) {
+    let event_loop: MutexGuard<Sender<RuffleEvent>> =
+        env.get_rust_field(this, "eventLoopHandle").unwrap();
+    let _ = event_loop.send(RuffleEvent::VirtualMouseEvent {
+        down: false,
+        x: x as f64,
+        y: y as f64,
+        button: button_code_to_mouse_button(button_code),
+    });
 }
 
 pub fn get_jvm<'a>() -> Result<(jni::JavaVM, JObject<'a>), Box<dyn std::error::Error>> {
