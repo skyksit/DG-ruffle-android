@@ -2791,6 +2791,7 @@ dependencies = [
  "async-task",
  "backtrace",
  "jni",
+ "lazy_static",
  "log",
  "ndk",
  "ndk-context",

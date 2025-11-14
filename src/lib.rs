@@ -124,6 +124,9 @@ impl<E: std::error::Error + 'static> FutureSpawner<E> for AndroidExecutor {
         runnable.schedule();
     }
 }
+use std::collections::HashMap;
+use lazy_static::lazy_static;
+
 // Static flag to track whether we've notified Java that content is ready
 static CONTENT_READY_NOTIFIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -133,9 +136,11 @@ static LAST_MOUSE_POSITION: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 // Mouse mode: 0 = Direct Touch (absolute), 1 = Relative Swipe
 static MOUSE_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-// Store touch start position and mouse position at touch start for relative mode
-static TOUCH_START: Mutex<Option<(f64, f64)>> = Mutex::new(None);
-static MOUSE_POS_AT_TOUCH_START: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
+// ✅ 멀티터치 지원: 포인터 ID별로 터치 시작점과 마우스 위치 추적
+lazy_static! {
+    static ref TOUCH_STARTS: Mutex<HashMap<usize, (f64, f64)>> = Mutex::new(HashMap::new());
+    static ref MOUSE_POS_AT_TOUCH_STARTS: Mutex<HashMap<usize, (f64, f64)>> = Mutex::new(HashMap::new());
+}
 
 // Touch click enabled: true = mouse click events on touch, false = only mouse move
 static TOUCH_CLICK_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -399,8 +404,8 @@ async fn run(app: AndroidApp) {
                                 while inputs.next(|input| match input {
                                     InputEvent::MotionEvent(event) => {
                                         let window = native_window.as_ref().unwrap();
-                                        let pointer = event.pointer_index();
-                                        let pointer = event.pointer_at_index(pointer);
+                                        let pointer_index = event.pointer_index();
+                                        let pointer = event.pointer_at_index(pointer_index);
                                         let coords: (i32, i32) = get_loc_in_window();
                                         let touch_x = pointer.x() as f64 - coords.0 as f64;
                                         let touch_y = pointer.y() as f64 - coords.1 as f64;
@@ -411,32 +416,39 @@ async fn run(app: AndroidApp) {
                                         // Check mouse mode: 0 = Direct Touch, 1 = Relative Swipe
                                         let mouse_mode = MOUSE_MODE.load(std::sync::atomic::Ordering::Relaxed);
                                         
+                                        // ✅ 멀티터치 지원: 포인터 ID 사용
+                                        let pointer_id = pointer_index; // pointer_index를 ID로 사용
+                                        
                                         let (mouse_x, mouse_y) = if mouse_mode == 0 {
                                             // Direct Touch mode: mouse position = touch position
                                             (scaled_touch_x, scaled_touch_y)
                                         } else {
-                                            // Relative Swipe mode: calculate relative movement
+                                            // Relative Swipe mode: calculate relative movement per pointer
                                             match event.action() {
                                                 MotionAction::Down | MotionAction::PointerDown | MotionAction::ButtonPress => {
-                                                    // Store touch start position and current mouse position
-                                                    if let Ok(mut touch_start) = TOUCH_START.lock() {
-                                                        *touch_start = Some((scaled_touch_x, scaled_touch_y));
+                                                    // ✅ Store touch start position for this pointer
+                                                    if let Ok(mut touch_starts) = TOUCH_STARTS.lock() {
+                                                        touch_starts.insert(pointer_id, (scaled_touch_x, scaled_touch_y));
                                                     }
-                                                    if let Ok(mut mouse_at_start) = MOUSE_POS_AT_TOUCH_START.lock() {
+                                                    // ✅ Store current mouse position for this pointer
+                                                    if let Ok(mut mouse_at_starts) = MOUSE_POS_AT_TOUCH_STARTS.lock() {
                                                         if let Ok(last_pos) = LAST_MOUSE_POSITION.lock() {
-                                                            *mouse_at_start = *last_pos;
+                                                            mouse_at_starts.insert(pointer_id, *last_pos);
                                                         }
                                                     }
                                                     // Return current mouse position (no movement on touch down)
                                                     LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone()
                                                 }
                                                 MotionAction::Move => {
-                                                    // Calculate relative movement from touch start
-                                                    let touch_start = TOUCH_START.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                                                    if let Some((start_x, start_y)) = touch_start {
+                                                    // ✅ Calculate relative movement from this pointer's touch start
+                                                    let touch_starts = TOUCH_STARTS.lock().unwrap_or_else(|e| e.into_inner());
+                                                    if let Some(&(start_x, start_y)) = touch_starts.get(&pointer_id) {
                                                         let delta_x = scaled_touch_x - start_x;
                                                         let delta_y = scaled_touch_y - start_y;
-                                                        let mouse_at_start = MOUSE_POS_AT_TOUCH_START.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                                                        
+                                                        let mouse_at_starts = MOUSE_POS_AT_TOUCH_STARTS.lock().unwrap_or_else(|e| e.into_inner());
+                                                        let mouse_at_start = mouse_at_starts.get(&pointer_id).copied().unwrap_or((0.0, 0.0));
+                                                        
                                                         let new_x = (mouse_at_start.0 + delta_x).max(0.0).min(window.width() as f64);
                                                         let new_y = (mouse_at_start.1 + delta_y).max(0.0).min(window.height() as f64);
                                                         (new_x, new_y)
@@ -445,9 +457,12 @@ async fn run(app: AndroidApp) {
                                                     }
                                                 }
                                                 MotionAction::Up | MotionAction::PointerUp | MotionAction::ButtonRelease => {
-                                                    // Clear touch start on release
-                                                    if let Ok(mut touch_start) = TOUCH_START.lock() {
-                                                        *touch_start = None;
+                                                    // ✅ Clear touch start for this pointer
+                                                    if let Ok(mut touch_starts) = TOUCH_STARTS.lock() {
+                                                        touch_starts.remove(&pointer_id);
+                                                    }
+                                                    if let Ok(mut mouse_at_starts) = MOUSE_POS_AT_TOUCH_STARTS.lock() {
+                                                        mouse_at_starts.remove(&pointer_id);
                                                     }
                                                     // Return current mouse position
                                                     LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone()
