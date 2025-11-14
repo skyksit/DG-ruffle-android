@@ -2831,6 +2831,7 @@ dependencies = [
  "android_logger",
  "backtrace",
  "jni",
+ "lazy_static",
  "log",
  "ndk",
  "ndk-context",
