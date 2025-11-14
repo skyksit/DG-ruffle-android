@@ -434,6 +434,13 @@
             android:tag="mouse_mode"
             android:text="🖱" />
 
+        <Button
+            android:id="@+id/button_screenshot"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:tag="screenshot"
+            android:text="📷" />
+
     </LinearLayout>
 
 </androidx.constraintlayout.widget.ConstraintLayout>
