@@ -448,9 +448,13 @@ class PlayerActivity : GameActivity() {
         
         // Pause button
         val pauseButton = layout.findViewById<Button>(R.id.button_pause)
+        
+        // 초기 상태 설정 - 게임 시작 시 항상 재생 중 상태
+        pauseButton.text = "⏸"
+        
         pauseButton.setOnClickListener {
             togglePause()
-            val paused = isPaused() == 0
+            val paused = isPaused() == 1  // 1 = paused, 0 = playing
             pauseButton.text = if (paused) "▶" else "⏸"
             val statusText = if (paused) "일시정지" else "재생 중"
             Toast.makeText(this, statusText, Toast.LENGTH_SHORT).show()
