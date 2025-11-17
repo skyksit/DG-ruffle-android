@@ -19,4 +19,5 @@ pub enum RuffleEvent {
     RunContextMenuCallback(usize),
     ClearContextMenu,
     RequestContextMenu,
+    TogglePause,
 }
