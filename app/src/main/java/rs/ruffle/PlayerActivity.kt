@@ -116,6 +116,8 @@ class PlayerActivity : GameActivity() {
     private external fun clearContextMenu()
     private external fun setMouseMode(mode: Int)
     private external fun setBackendMode(mode: Int)
+    private external fun togglePause()
+    private external fun isPaused(): Int
     
     // Mouse mode: 0 = Direct Touch, 1 = Relative Swipe
     private var mouseMode = 0
@@ -442,6 +444,17 @@ class PlayerActivity : GameActivity() {
             val backendName = if (backendMode == 0) "VULKAN" else "GL"
             Toast.makeText(this, "백엔드: $backendName (재시작 필요)", Toast.LENGTH_SHORT).show()
             Log.i("ruffle", "Backend mode changed to: $backendName")
+        }
+        
+        // Pause button
+        val pauseButton = layout.findViewById<Button>(R.id.button_pause)
+        pauseButton.setOnClickListener {
+            togglePause()
+            val paused = isPaused() == 0
+            pauseButton.text = if (paused) "▶" else "⏸"
+            val statusText = if (paused) "일시정지" else "재생 중"
+            Toast.makeText(this, statusText, Toast.LENGTH_SHORT).show()
+            Log.i("ruffle", "Game ${if (paused) "paused" else "resumed"}")
         }
         
         layout.requestLayout()

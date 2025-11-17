@@ -99,6 +99,9 @@ lazy_static! {
 // Touch click enabled: true = mouse click events on touch, false = only mouse move
 static TOUCH_CLICK_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+// Pause state: true = paused, false = playing
+static IS_PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[tokio::main]
 async fn run(app: AndroidApp) {
     let mut last_frame_time = Instant::now();
@@ -657,6 +660,19 @@ async fn run(app: AndroidApp) {
                     needs_redraw = true;
                 }
             }
+            Ok(RuffleEvent::TogglePause) => {
+                if let Some(player) = playerbox.as_ref() {
+                    let is_paused = IS_PAUSED.load(std::sync::atomic::Ordering::Relaxed);
+                    let new_state = !is_paused;
+                    IS_PAUSED.store(new_state, std::sync::atomic::Ordering::Relaxed);
+                    
+                    let mut player_lock = player.player.lock().unwrap();
+                    player_lock.set_is_playing(!new_state);
+                    
+                    log::info!("Game {}", if new_state { "paused" } else { "resumed" });
+                    needs_redraw = true;
+                }
+            }
         }
 
         let new_time = Instant::now();
@@ -911,6 +927,30 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_setBackendMode(
     // mode: 0 = VULKAN (default), 1 = GL
     BACKEND_MODE.store(mode as u8, std::sync::atomic::Ordering::Relaxed);
     log::info!("Backend mode changed to: {}", if mode == 1 { "GL" } else { "VULKAN" });
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_togglePause(
+    mut env: JNIEnv,
+    this: JObject,
+) {
+    let event_loop: MutexGuard<Sender<RuffleEvent>> =
+        env.get_rust_field(this, "eventLoopHandle").unwrap();
+    let _ = event_loop.send(RuffleEvent::TogglePause);
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_isPaused(
+    _env: JNIEnv,
+    _this: JObject,
+) -> jint {
+    if IS_PAUSED.load(std::sync::atomic::Ordering::Relaxed) {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
