@@ -119,6 +119,10 @@ async fn run(app: AndroidApp) {
     let trace_output;
     let android_storage_dir;
 
+    // 게임 시작 시 pause 상태 초기화 (재시작 시에도 올바르게 동작하도록)
+    IS_PAUSED.store(false, std::sync::atomic::Ordering::Relaxed);
+    log::info!("Pause state initialized to: playing");
+
     unsafe {
         let vm = JavaVM::from_raw(app.vm_as_ptr() as *mut sys::JavaVM).expect("JVM must exist");
         let activity = JObject::from_raw(app.activity_as_ptr() as jobject);
