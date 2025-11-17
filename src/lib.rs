@@ -87,6 +87,9 @@ static LAST_MOUSE_POSITION: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 // Mouse mode: 0 = Direct Touch (absolute), 1 = Relative Swipe
 static MOUSE_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+// Backend mode: 0 = VULKAN (default), 1 = GL
+static BACKEND_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 // ✅ 멀티터치 지원: 포인터 ID별로 터치 시작점과 마우스 위치 추적
 lazy_static! {
     static ref TOUCH_STARTS: Mutex<HashMap<usize, (f64, f64)>> = Mutex::new(HashMap::new());
@@ -246,6 +249,15 @@ async fn run(app: AndroidApp) {
                                 }
                                 player_lock.set_is_playing(true);
                             } else {
+                                // Get backend mode: 0 = VULKAN (default), 1 = GL
+                                let backend_mode = BACKEND_MODE.load(std::sync::atomic::Ordering::Relaxed);
+                                let backend = if backend_mode == 1 {
+                                    wgpu::Backends::GL
+                                } else {
+                                    wgpu::Backends::VULKAN
+                                };
+                                log::info!("Using backend: {:?}", backend);
+                                
                                 let renderer = unsafe {
                                     // TODO: make this take an Arc<Window> instead?
                                     WgpuRenderBackend::for_window_unsafe(
@@ -259,7 +271,7 @@ async fn run(app: AndroidApp) {
                                                 .into(),
                                         },
                                         (dimensions.width, dimensions.height),
-                                        wgpu::Backends::GL,
+                                        backend,
                                         wgpu::PowerPreference::HighPerformance,
                                     )
                                     .unwrap()
@@ -887,6 +899,18 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_setTouchClickEnabled(
     let is_enabled = enabled != 0;
     TOUCH_CLICK_ENABLED.store(is_enabled, std::sync::atomic::Ordering::Relaxed);
     log::info!("Touch click events: {}", if is_enabled { "enabled" } else { "disabled" });
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_setBackendMode(
+    _env: JNIEnv,
+    _this: JObject,
+    mode: jint,
+) {
+    // mode: 0 = VULKAN (default), 1 = GL
+    BACKEND_MODE.store(mode as u8, std::sync::atomic::Ordering::Relaxed);
+    log::info!("Backend mode changed to: {}", if mode == 1 { "GL" } else { "VULKAN" });
 }
 
 #[no_mangle]

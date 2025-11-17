@@ -115,9 +115,13 @@ class PlayerActivity : GameActivity() {
     private external fun runContextMenuCallback(index: Int)
     private external fun clearContextMenu()
     private external fun setMouseMode(mode: Int)
+    private external fun setBackendMode(mode: Int)
     
     // Mouse mode: 0 = Direct Touch, 1 = Relative Swipe
     private var mouseMode = 0
+    
+    // Backend mode: 0 = VULKAN (default), 1 = GL
+    private var backendMode = 0
 
     @Suppress("unused")
     // Used by Rust
@@ -429,6 +433,17 @@ class PlayerActivity : GameActivity() {
             Log.i("ruffle", "Screenshot requested")
         }
         
+        // Backend mode toggle button
+        val backendButton = layout.findViewById<Button>(R.id.button_backend)
+        backendButton.setOnClickListener {
+            backendMode = if (backendMode == 0) 1 else 0
+            setBackendMode(backendMode)
+            backendButton.text = if (backendMode == 0) "🖥" else "🔧"
+            val backendName = if (backendMode == 0) "VULKAN" else "GL"
+            Toast.makeText(this, "백엔드: $backendName (재시작 필요)", Toast.LENGTH_SHORT).show()
+            Log.i("ruffle", "Backend mode changed to: $backendName")
+        }
+        
         layout.requestLayout()
         layout.requestFocus()
         mSurfaceView.holder.addCallback(this)
@@ -471,6 +486,11 @@ class PlayerActivity : GameActivity() {
                 }
             )
         }
+        
+        // Set default backend mode: 0 = VULKAN (default), 1 = GL
+        setBackendMode(backendMode)
+        Log.i("ruffle", "Initial backend mode set to: ${if (backendMode == 0) "VULKAN" else "GL"}")
+        
         // When true, the app will fit inside any system UI windows.
         // When false, we render behind any system UI windows.
         WindowCompat.setDecorFitsSystemWindows(window, false)
