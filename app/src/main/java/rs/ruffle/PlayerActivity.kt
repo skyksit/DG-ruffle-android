@@ -4,7 +4,6 @@ import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Bitmap
-import android.graphics.Canvas
 import android.net.Uri
 import android.os.Build
 import android.os.Build.VERSION_CODES
@@ -25,10 +24,13 @@ import android.widget.Button
 import android.widget.PopupMenu
 import android.widget.Toast
 import androidx.constraintlayout.widget.ConstraintLayout
+import androidx.core.graphics.createBitmap
+import androidx.core.graphics.get
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.core.view.isVisible
 import com.google.androidgamesdk.GameActivity
 import java.io.DataInputStream
 import java.io.File
@@ -78,7 +80,7 @@ class PlayerActivity : GameActivity() {
     @Suppress("unused")
     // Used by Rust
     private fun navigateToUrl(url: String?) {
-        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+//        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
     }
 
     private var loc = IntArray(2)
@@ -135,10 +137,10 @@ class PlayerActivity : GameActivity() {
                 val caption = elements[3]
                 if (separatorBefore) group += 1
                 val item = menu.add(group, i, Menu.NONE, caption)
-                item.setEnabled(enabled)
+                item.isEnabled = enabled
                 if (checked) {
-                    item.setCheckable(true)
-                    item.setChecked(true)
+                    item.isCheckable = true
+                    item.isChecked = true
                 }
             }
             val exitItemId: Int = items.size
@@ -194,7 +196,7 @@ class PlayerActivity : GameActivity() {
         // Find top border
         outer@ for (y in 0 until height) {
             for (x in 0 until width) {
-                val pixel = original.getPixel(x, y)
+                val pixel = original[x, y]
                 val r = (pixel shr 16) and 0xFF
                 val g = (pixel shr 8) and 0xFF
                 val b = pixel and 0xFF
@@ -208,7 +210,7 @@ class PlayerActivity : GameActivity() {
         // Find bottom border
         outer@ for (y in height - 1 downTo 0) {
             for (x in 0 until width) {
-                val pixel = original.getPixel(x, y)
+                val pixel = original[x, y]
                 val r = (pixel shr 16) and 0xFF
                 val g = (pixel shr 8) and 0xFF
                 val b = pixel and 0xFF
@@ -222,7 +224,7 @@ class PlayerActivity : GameActivity() {
         // Find left border
         outer@ for (x in 0 until width) {
             for (y in topCrop..bottomCrop) {
-                val pixel = original.getPixel(x, y)
+                val pixel = original[x, y]
                 val r = (pixel shr 16) and 0xFF
                 val g = (pixel shr 8) and 0xFF
                 val b = pixel and 0xFF
@@ -236,7 +238,7 @@ class PlayerActivity : GameActivity() {
         // Find right border
         outer@ for (x in width - 1 downTo 0) {
             for (y in topCrop..bottomCrop) {
-                val pixel = original.getPixel(x, y)
+                val pixel = original[x, y]
                 val r = (pixel shr 16) and 0xFF
                 val g = (pixel shr 8) and 0xFF
                 val b = pixel and 0xFF
@@ -285,140 +287,79 @@ class PlayerActivity : GameActivity() {
             
             Log.i("ruffle", "Capturing screenshot: ${surfaceWidth}x${surfaceHeight}")
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                // Use PixelCopy for Android N and above (more reliable)
-                // This captures only the visible game area from the Surface
-                val bitmap = Bitmap.createBitmap(
-                    surfaceWidth,
-                    surfaceHeight,
-                    Bitmap.Config.ARGB_8888
-                )
+            // Use PixelCopy for Android N and above (more reliable)
+            // This captures only the visible game area from the Surface
+            val bitmap = createBitmap(surfaceWidth, surfaceHeight)
 
-                // PixelCopy captures directly from the Surface, 
-                // which contains only the game rendering (no UI elements)
-                PixelCopy.request(
-                    mSurfaceView.holder.surface,
-                    bitmap,
-                    { copyResult ->
-                        if (copyResult == PixelCopy.SUCCESS) {
-                            try {
-                                // Remove letterbox from screenshot
-                                val croppedBitmap = removeLetterbox(bitmap)
-                                
-                                FileOutputStream(file).use { out ->
-                                    croppedBitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
-                                }
-                                
-                                // Clean up bitmaps
-                                if (croppedBitmap !== bitmap) {
-                                    croppedBitmap.recycle()
-                                }
-                                
-                                runOnUiThread {
-                                    Toast.makeText(
-                                        this,
-                                        "게임 화면이 저장되었습니다: $filename",
-                                        Toast.LENGTH_LONG
-                                    ).show()
-                                }
-                                Log.i("ruffle", "Game screenshot saved: ${file.absolutePath}")
-                            } catch (e: IOException) {
-                                Log.e("ruffle", "Failed to save screenshot", e)
-                                runOnUiThread {
-                                    Toast.makeText(
-                                        this,
-                                        "스크린샷 저장 실패: ${e.message}",
-                                        Toast.LENGTH_SHORT
-                                    ).show()
-                                }
-                            } catch (e: Exception) {
-                                Log.e("ruffle", "Failed to crop screenshot", e)
-                                // Fall back to saving original bitmap
-                                try {
-                                    FileOutputStream(file).use { out ->
-                                        bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
-                                    }
-                                    runOnUiThread {
-                                        Toast.makeText(
-                                            this,
-                                            "게임 화면이 저장되었습니다 (원본): $filename",
-                                            Toast.LENGTH_LONG
-                                        ).show()
-                                    }
-                                } catch (e2: IOException) {
-                                    Log.e("ruffle", "Failed to save fallback screenshot", e2)
-                                }
+            // PixelCopy captures directly from the Surface,
+            // which contains only the game rendering (no UI elements)
+            PixelCopy.request(
+                mSurfaceView.holder.surface,
+                bitmap,
+                { copyResult ->
+                    if (copyResult == PixelCopy.SUCCESS) {
+                        try {
+                            // Remove letterbox from screenshot
+                            val croppedBitmap = removeLetterbox(bitmap)
+
+                            FileOutputStream(file).use { out ->
+                                croppedBitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
                             }
-                        } else {
-                            Log.e("ruffle", "PixelCopy failed: $copyResult")
+
+                            // Clean up bitmaps
+                            if (croppedBitmap !== bitmap) {
+                                croppedBitmap.recycle()
+                            }
+
                             runOnUiThread {
                                 Toast.makeText(
                                     this,
-                                    "스크린샷 캡처 실패",
+                                    "게임 화면이 저장되었습니다: $filename",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                            Log.i("ruffle", "Game screenshot saved: ${file.absolutePath}")
+                        } catch (e: IOException) {
+                            Log.e("ruffle", "Failed to save screenshot", e)
+                            runOnUiThread {
+                                Toast.makeText(
+                                    this,
+                                    "스크린샷 저장 실패: ${e.message}",
                                     Toast.LENGTH_SHORT
                                 ).show()
                             }
+                        } catch (e: Exception) {
+                            Log.e("ruffle", "Failed to crop screenshot", e)
+                            // Fall back to saving original bitmap
+                            try {
+                                FileOutputStream(file).use { out ->
+                                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+                                }
+                                runOnUiThread {
+                                    Toast.makeText(
+                                        this,
+                                        "게임 화면이 저장되었습니다 (원본): $filename",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                }
+                            } catch (e2: IOException) {
+                                Log.e("ruffle", "Failed to save fallback screenshot", e2)
+                            }
                         }
-                        bitmap.recycle()
-                    },
-                    Handler(Looper.getMainLooper())
-                )
-            } else {
-                // Fallback for older Android versions
-                // Note: This method may include some artifacts but works on older devices
-                val bitmap = Bitmap.createBitmap(
-                    surfaceWidth,
-                    surfaceHeight,
-                    Bitmap.Config.ARGB_8888
-                )
-                val canvas = Canvas(bitmap)
-                mSurfaceView.draw(canvas)
-
-                try {
-                    // Remove letterbox from screenshot
-                    val croppedBitmap = removeLetterbox(bitmap)
-                    
-                    FileOutputStream(file).use { out ->
-                        croppedBitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
-                    }
-                    
-                    // Clean up bitmaps
-                    if (croppedBitmap !== bitmap) {
-                        croppedBitmap.recycle()
-                    }
-                    
-                    Toast.makeText(
-                        this,
-                        "게임 화면이 저장되었습니다: $filename",
-                        Toast.LENGTH_LONG
-                    ).show()
-                    Log.i("ruffle", "Game screenshot saved: ${file.absolutePath}")
-                } catch (e: IOException) {
-                    Log.e("ruffle", "Failed to save screenshot", e)
-                    Toast.makeText(
-                        this,
-                        "스크린샷 저장 실패: ${e.message}",
-                        Toast.LENGTH_SHORT
-                    ).show()
-                } catch (e: Exception) {
-                    Log.e("ruffle", "Failed to crop screenshot", e)
-                    // Fall back to saving original bitmap
-                    try {
-                        FileOutputStream(file).use { out ->
-                            bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+                    } else {
+                        Log.e("ruffle", "PixelCopy failed: $copyResult")
+                        runOnUiThread {
+                            Toast.makeText(
+                                this,
+                                "스크린샷 캡처 실패",
+                                Toast.LENGTH_SHORT
+                            ).show()
                         }
-                        Toast.makeText(
-                            this,
-                            "게임 화면이 저장되었습니다 (원본): $filename",
-                            Toast.LENGTH_LONG
-                        ).show()
-                    } catch (e2: IOException) {
-                        Log.e("ruffle", "Failed to save fallback screenshot", e2)
                     }
-                } finally {
                     bitmap.recycle()
-                }
-            }
+                },
+                Handler(Looper.getMainLooper())
+            )
         } catch (e: Exception) {
             Log.e("ruffle", "Screenshot capture error", e)
             Toast.makeText(
@@ -464,7 +405,7 @@ class PlayerActivity : GameActivity() {
         }
         layout.findViewById<View>(R.id.button_kb).setOnClickListener {
             val keyboard = layout.getViewById(R.id.keyboard)
-            if (keyboard.visibility == View.VISIBLE) {
+            if (keyboard.isVisible) {
                 keyboard.visibility = View.GONE
             } else {
                 keyboard.visibility = View.VISIBLE
