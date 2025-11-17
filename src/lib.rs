@@ -957,15 +957,24 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_nativeInit(
     let crash_callback = env.new_global_ref(crash_callback).unwrap();
     let jvm = env.get_java_vm().unwrap();
 
+    // Debug 빌드: 상세한 로그 출력, Release 빌드: 로그 끄기
+    #[cfg(debug_assertions)]
     android_logger::init_once(
         android_logger::Config::default()
             .with_max_level(log::LevelFilter::Info)
             .with_tag("ruffle")
             .with_filter(
                 android_logger::FilterBuilder::new()
-                    .parse("warn,ruffle=info")
+                    .parse("warn,ruffle=info,wgpu_hal=info,wgpu_hal::gles=off,wgpu_core=info,symphonia_bundle_mp3=error,ruffle_core::tag_utils=error")
                     .build(),
             ),
+    );
+
+    #[cfg(not(debug_assertions))]
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_max_level(log::LevelFilter::Off)
+            .with_tag("ruffle"),
     );
 
     panic::set_hook(Box::new(move |info| {
