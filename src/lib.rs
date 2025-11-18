@@ -77,9 +77,13 @@ impl PollRequester for EventSender {
 }
 use std::collections::HashMap;
 use lazy_static::lazy_static;
+use jni::objects::GlobalRef;
 
 // Static flag to track whether we've notified Java that content is ready
 static CONTENT_READY_NOTIFIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// 🛡️ Store crash callback Global Reference for cleanup
+static CRASH_CALLBACK_REF: Mutex<Option<GlobalRef>> = Mutex::new(None);
 
 // Store the last mouse position for virtual mouse events
 static LAST_MOUSE_POSITION: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
@@ -964,7 +968,14 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_nativeInit(
     class: JClass,
     crash_callback: JObject,
 ) {
-    let crash_callback = env.new_global_ref(crash_callback).unwrap();
+    let crash_callback_ref = env.new_global_ref(crash_callback).unwrap();
+    
+    // 🛡️ Store Global Reference for cleanup
+    if let Ok(mut stored_ref) = CRASH_CALLBACK_REF.lock() {
+        *stored_ref = Some(crash_callback_ref.clone());
+    }
+    
+    let crash_callback = crash_callback_ref;
     let jvm = env.get_java_vm().unwrap();
 
     // Debug 빌드: 상세한 로그 출력, Release 빌드: 로그 끄기
@@ -1032,6 +1043,33 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_nativeInit(
     }));
 
     JavaInterface::init(&mut env, &class)
+}
+
+/// 🛡️ nativeCleanup - JNI Global Reference 해제하여 메모리 누수 방지
+/// Activity.onDestroy()에서 호출되어야 함
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_nativeCleanup(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    log::info!("nativeCleanup called - releasing Global References");
+    
+    // 1. 패닉 핸들러를 기본값으로 되돌림
+    // 이렇게 하면 클로저가 캡처한 crash_callback이 해제됨
+    let _ = panic::take_hook();
+    log::info!("Panic hook reset to default");
+    
+    // 2. Crash callback Global Reference 해제
+    if let Ok(mut stored_ref) = CRASH_CALLBACK_REF.lock() {
+        if let Some(global_ref) = stored_ref.take() {
+            // Global Reference를 명시적으로 삭제
+            drop(global_ref);
+            log::info!("Crash callback Global Reference released");
+        }
+    }
+    
+    log::info!("nativeCleanup completed successfully");
 }
 
 fn get_loc_in_window() -> (i32, i32) {
