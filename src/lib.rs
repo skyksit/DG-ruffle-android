@@ -34,26 +34,49 @@ use jni::objects::JClass;
 use audio::AAudioAudioBackend;
 use url::Url;
 
+use ruffle_common::duration::FloatDuration;
 use ruffle_core::{
+    backend::navigator::OwnedFuture,
     events::{LogicalKey, MouseButton, PlayerEvent},
     tag_utils::SwfMovie,
     Player, PlayerBuilder, ViewportDimensions,
 };
-use ruffle_frontend_utils::backends::executor::{AsyncExecutor, PollRequester};
-use ruffle_frontend_utils::backends::navigator::ExternalNavigatorBackend;
 use ruffle_frontend_utils::backends::storage::DiskStorageBackend;
 use ruffle_frontend_utils::content::PlayingContent;
+use ruffle_frontend_utils::{
+    backends::navigator::{ExternalNavigatorBackend, FutureSpawner},
+    content::ContentDescriptor,
+};
 
 use crate::navigator::AndroidNavigatorInterface;
 use crate::trace::FileLogBackend;
 use java::JavaInterface;
 use ruffle_render_wgpu::{backend::WgpuRenderBackend, target::SwapChainTarget};
 
+/// A unique identifier for a given `Player` instance.
+/// Used to track which player any currently executing future is bound to.
+#[derive(Copy, Clone, Eq, PartialEq)]
+struct PlayerId(i64);
+
+impl PlayerId {
+    fn new() -> Self {
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        static NEXT: AtomicI64 = AtomicI64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        assert!(id >= 0, "PlayerId overflowed!");
+        Self(id)
+    }
+}
+
+/// A `Player`-bound future that is currently running.
+pub struct PlayerRunnable(async_task::Runnable<PlayerId>);
+
 /// Represents a current Player and any associated state with that player,
 /// which may be lost when this Player is closed (dropped)
 struct ActivePlayer {
+    id: PlayerId,
     player: Arc<Mutex<Player>>,
-    executor: Arc<AsyncExecutor<EventSender>>,
 }
 
 #[derive(Clone)]
@@ -70,9 +93,35 @@ impl EventSender {
     }
 }
 
-impl PollRequester for EventSender {
-    fn request_poll(&self) {
-        self.send(RuffleEvent::TaskPoll);
+/// A bare-bones executor that schedules tasks on the winit event loop.
+struct AndroidExecutor {
+    event_loop: EventSender,
+    player_id: PlayerId,
+}
+
+impl<E: std::error::Error + 'static> FutureSpawner<E> for AndroidExecutor {
+    fn spawn(&self, future: OwnedFuture<(), E>) {
+        // Discard any errors.
+        let future = async {
+            if let Err(e) = future.await {
+                tracing::error!("Async error: {}", e);
+            }
+        };
+
+        let event_loop = self.event_loop.clone();
+        let scheduler = move |task| {
+            let event = RuffleEvent::TaskPoll(PlayerRunnable(task));
+            event_loop.send(event)
+        };
+
+        let (runnable, task) = async_task::Builder::new()
+            .metadata(self.player_id)
+            .spawn_local(|_| future, scheduler);
+
+        // The future should run in the background.
+        task.detach();
+        // Immediately schedule the future to be polled for the first time.
+        runnable.schedule();
     }
 }
 use std::collections::HashMap;
@@ -288,10 +337,13 @@ async fn run(app: AndroidApp) {
                                     .unwrap()
                                 };
                                 let movie_url = Url::parse("file://movie.swf").unwrap();
+                                let player_id = PlayerId::new();
 
-                                let (executor, future_spawner) = AsyncExecutor::new(
-                                    sender.clone(),
-                                );
+                                let future_spawner = AndroidExecutor {
+                                    event_loop: sender.clone(),
+                                    player_id,
+                                };
+
                                 let navigator = ExternalNavigatorBackend::new(
                                     movie_url.clone(),
                                     None,
@@ -301,11 +353,12 @@ async fn run(app: AndroidApp) {
                                     true,
                                     Default::default(),
                                     ruffle_core::backend::navigator::SocketMode::Allow,
-                                    Rc::new(PlayingContent::DirectFile(movie_url)),
+                                    Rc::new(PlayingContent::DirectFile(ContentDescriptor::new_remote(movie_url))),
                                     AndroidNavigatorInterface,
                                 );
 
                                 playerbox = Some(ActivePlayer {
+                                    id: player_id,
                                     player: PlayerBuilder::new()
                                             .with_renderer(renderer)
                                             .with_audio(AAudioAudioBackend::new().unwrap())
@@ -316,7 +369,6 @@ async fn run(app: AndroidApp) {
                                                 ruffle_video_software::backend::SoftwareVideoBackend::new(),
                                             )
                                         .build(),
-                                        executor,
                                     }
                                 );
 
@@ -328,7 +380,7 @@ async fn run(app: AndroidApp) {
                                 let bytes = JavaInterface::get_swf_bytes(&mut env, &activity);
 
                                 if let Some(bytes) = bytes {
-                                    let movie = SwfMovie::from_data(&bytes, url, None).unwrap();
+                                    let movie = SwfMovie::from_data(&bytes, url, None, None).unwrap();
                                     player_lock.mutate_with_update_context(|context| {
                                         context.set_root_movie(movie);
                                     });
@@ -543,9 +595,14 @@ async fn run(app: AndroidApp) {
 
         match receiver.try_recv() {
             Err(_) => {}
-            Ok(RuffleEvent::TaskPoll) => {
+            Ok(RuffleEvent::TaskPoll(task)) => {
+                // Only run the task if it matches our current player;
+                // otherwise it is stale, and should be cancelled (which
+                // happens implicitly on drop).
                 if let Some(player) = playerbox.as_ref() {
-                    player.executor.poll_all()
+                    if *task.0.metadata() == player.id {
+                        task.0.run();
+                    }
                 }
             }
             Ok(RuffleEvent::VirtualKeyEvent {
@@ -689,7 +746,7 @@ async fn run(app: AndroidApp) {
             last_frame_time = new_time;
             if let Some(player) = playerbox.as_ref() {
                 if let Ok(mut player) = player.player.lock() {
-                    player.tick(dt as f64 / 1000.0);
+                    player.tick(FloatDuration::from_millis(dt as f64 / 1000.0));
                     next_frame_time = Some(new_time + player.time_til_next_frame());
                     needs_redraw = player.needs_render();
                     let audio =

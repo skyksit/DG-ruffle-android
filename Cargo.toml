@@ -27,8 +27,9 @@ ndk = { version = "0.9.0", features = ["audio"] }
 ndk-context = "0.1.1"
 
 # Have to follow Ruffle with this.
-wgpu = "26.0.1"
+wgpu = "27.0.1"
 
+ruffle_common = { git = "https://github.com/ruffle-rs/ruffle.git", branch = "master" }
 ruffle_core = { git = "https://github.com/ruffle-rs/ruffle.git", branch = "master", features = [
     "audio",
     "symphonia",
@@ -38,24 +39,28 @@ ruffle_core = { git = "https://github.com/ruffle-rs/ruffle.git", branch = "maste
     "default_compatibility_rules",
     "default_font",
 ] }
-
 ruffle_render_wgpu = { git = "https://github.com/ruffle-rs/ruffle.git", branch = "master" }
 ruffle_video_software = { git = "https://github.com/ruffle-rs/ruffle.git", branch = "master" }
-ruffle_frontend_utils = { git = "https://github.com/ruffle-rs/ruffle.git", branch = "master", features = ["fs", "navigator", "executor"] }
+ruffle_frontend_utils = { git = "https://github.com/ruffle-rs/ruffle.git", branch = "master", default-features = false, features = ["fs", "navigator", "rustls-tls"] }
 
-log = "0.4.28"
+log = "0.4.32"
 
 # Redirect tracing to log
-tracing = {version = "0.1.41", features = ["log", "log-always"]}
+tracing = {version = "0.1.44", features = ["log", "log-always"]}
 backtrace = "0.3.76"
+async-task = "4.7.1"
 
 url = "2.5.2"
-webbrowser = "1.0.6"
+webbrowser = "1.1.0"
 
-tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros"]}
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"]}
 
 # ✅ 멀티터치 지원: 포인터별 상태 관리
 lazy_static = "1.4"
 
 [features]
 jpegxr = ["ruffle_core/jpegxr"]
+
+# so Rascal doesn't pull in another copy of swf from crates.io
+[patch.crates-io]
+swf = { git = "https://github.com/ruffle-rs/ruffle.git", branch = "master" }

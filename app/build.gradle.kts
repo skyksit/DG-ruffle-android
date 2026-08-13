@@ -21,14 +21,14 @@ plugins {
 
 android {
     namespace = "rs.ruffle"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "rs.ruffle"
         minSdk = 26
         targetSdk = 35
-        versionCode = 251110
-        versionName = "0.251110"
+        versionCode = 260720
+        versionName = "0.260720"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
