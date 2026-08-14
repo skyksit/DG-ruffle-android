@@ -21,6 +21,8 @@ pub struct JavaInterface {
     get_loc_in_window: JMethodID,
     get_android_data_storage_dir: JMethodID,
     on_content_ready: JMethodID,
+    /// Optional: not all frontends implement this callback.
+    on_shared_objects_flushed: Option<JMethodID>,
 }
 
 static JAVA_INTERFACE: OnceLock<JavaInterface> = OnceLock::new();
@@ -184,6 +186,16 @@ impl JavaInterface {
         result.expect("onContentReady() must never throw");
     }
 
+    pub fn on_shared_objects_flushed(env: &mut JNIEnv, this: &JObject) {
+        let Some(method) = Self::get().on_shared_objects_flushed else {
+            return;
+        };
+        let result = unsafe {
+            env.call_method_unchecked(this, method, ReturnType::Primitive(Primitive::Void), &[])
+        };
+        result.expect("onSharedObjectsFlushed() must never throw");
+    }
+
     pub fn init(env: &mut JNIEnv, class: &JClass) {
         let _ = JAVA_INTERFACE.set(JavaInterface {
             get_surface_width: env
@@ -213,6 +225,16 @@ impl JavaInterface {
             on_content_ready: env
                 .get_method_id(class, "onContentReady", "()V")
                 .expect("onContentReady must exist"),
+            on_shared_objects_flushed: {
+                let id = env
+                    .get_method_id(class, "onSharedObjectsFlushed", "()V")
+                    .ok();
+                if id.is_none() {
+                    // get_method_id leaves a pending NoSuchMethodError; clear it.
+                    let _ = env.exception_clear();
+                }
+                id
+            },
         });
     }
 }

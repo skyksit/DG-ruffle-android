@@ -20,4 +20,7 @@ pub enum RuffleEvent {
     ClearContextMenu,
     RequestContextMenu,
     TogglePause,
+    /// Flush all SharedObjects (.sol) to disk immediately, then notify Java
+    /// via the optional `onSharedObjectsFlushed()` callback.
+    FlushSharedObjects,
 }
