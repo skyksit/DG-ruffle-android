@@ -731,12 +731,25 @@ async fn run(app: AndroidApp) {
                     let is_paused = IS_PAUSED.load(std::sync::atomic::Ordering::Relaxed);
                     let new_state = !is_paused;
                     IS_PAUSED.store(new_state, std::sync::atomic::Ordering::Relaxed);
-                    
+
                     let mut player_lock = player.player.lock().unwrap();
                     player_lock.set_is_playing(!new_state);
-                    
+
                     log::info!("Game {}", if new_state { "paused" } else { "resumed" });
                     needs_redraw = true;
+                }
+            }
+            Ok(RuffleEvent::FlushSharedObjects) => {
+                if let Some(player) = playerbox.as_ref() {
+                    player.player.lock().unwrap().flush_shared_objects();
+                    log::info!("Shared objects flushed on request");
+                }
+                // Always notify Java so a waiting caller is released even
+                // when no player exists yet.
+                if let Ok((jvm, activity)) = get_jvm() {
+                    if let Ok(mut env) = jvm.attach_current_thread() {
+                        JavaInterface::on_shared_objects_flushed(&mut env, &activity);
+                    }
                 }
             }
         }
@@ -1004,6 +1017,17 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_togglePause(
     let event_loop: MutexGuard<Sender<RuffleEvent>> =
         env.get_rust_field(this, "eventLoopHandle").unwrap();
     let _ = event_loop.send(RuffleEvent::TogglePause);
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_flushSharedObjects(
+    mut env: JNIEnv,
+    this: JObject,
+) {
+    let event_loop: MutexGuard<Sender<RuffleEvent>> =
+        env.get_rust_field(this, "eventLoopHandle").unwrap();
+    let _ = event_loop.send(RuffleEvent::FlushSharedObjects);
 }
 
 #[no_mangle]
