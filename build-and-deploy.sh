@@ -96,6 +96,7 @@ cargo ndk \
     -t armeabi-v7a \
     -t x86 \
     -t x86_64 \
+    -P 26 \
     -o "$JNI_OUTPUT_DIR" \
     build --release
 
