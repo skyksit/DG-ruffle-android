@@ -20,7 +20,12 @@ pub enum RuffleEvent {
     ClearContextMenu,
     RequestContextMenu,
     TogglePause,
-    /// Flush all SharedObjects (.sol) to disk immediately, then notify Java
-    /// via the optional `onSharedObjectsFlushed()` callback.
+    /// Flush all SharedObjects (.sol) to disk, then notify Java via the
+    /// optional `onSharedObjectsFlushed()` callback.
+    ///
+    /// Not synchronous with the `flushSharedObjects()` JNI call that queues it:
+    /// the write happens when the event loop next drains this event. A host
+    /// that calls it from `onPause()` and is then killed may lose the save, so
+    /// wait for `onSharedObjectsFlushed()` before assuming it is persisted.
     FlushSharedObjects,
 }

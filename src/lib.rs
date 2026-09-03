@@ -12,11 +12,16 @@ use jni::{
     sys::{self, jint, jobject},
     JNIEnv, JavaVM,
 };
-use keycodes::{android_key_event_to_ruffle_key_descriptor, key_tag_to_key_descriptor, keycode_to_key_descriptor};
+use keycodes::{
+    android_key_event_to_ruffle_key_descriptor, key_tag_to_key_descriptor,
+    keycode_to_key_descriptor,
+};
 use std::any::Any;
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{mpsc, MutexGuard};
+use std::sync::{mpsc, LazyLock, MutexGuard};
 use std::time::Duration;
 use std::{
     panic,
@@ -29,7 +34,7 @@ use wgpu::rwh::{AndroidDisplayHandle, HasWindowHandle, RawDisplayHandle};
 use android_activity::input::{InputEvent, KeyAction, MotionAction};
 use android_activity::{AndroidApp, AndroidAppWaker, InputStatus, MainEvent, PollEvent};
 use backtrace::Backtrace;
-use jni::objects::JClass;
+use jni::objects::{GlobalRef, JClass};
 
 use audio::AAudioAudioBackend;
 use url::Url;
@@ -124,36 +129,150 @@ impl<E: std::error::Error + 'static> FutureSpawner<E> for AndroidExecutor {
         runnable.schedule();
     }
 }
-use std::collections::HashMap;
-use lazy_static::lazy_static;
-use jni::objects::GlobalRef;
+/// Whether Java has already been told that content is ready for the current
+/// movie. Reset by `reset_player_state()` on every `run()`.
+static CONTENT_READY_NOTIFIED: AtomicBool = AtomicBool::new(false);
 
-// Static flag to track whether we've notified Java that content is ready
-static CONTENT_READY_NOTIFIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-// 🛡️ Store crash callback Global Reference for cleanup
+/// Crash callback global reference, kept so `nativeCleanup` can release it.
 static CRASH_CALLBACK_REF: Mutex<Option<GlobalRef>> = Mutex::new(None);
 
-// Store the last mouse position for virtual mouse events
-static LAST_MOUSE_POSITION: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
+/// Last virtual cursor position, or `None` while the surface has not been
+/// touched yet. Must not be a `(0.0, 0.0)` sentinel: that is a legitimate
+/// position (top-left corner) and would make clicks there unreachable.
+static LAST_MOUSE_POSITION: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 
-// Mouse mode: 0 = Direct Touch (absolute), 1 = Relative Swipe
-static MOUSE_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Mouse mode: 0 = Direct Touch (absolute), 1 = Relative Swipe (trackpad).
+static MOUSE_MODE: AtomicU8 = AtomicU8::new(0);
 
-// Backend mode: 0 = VULKAN (default), 1 = GL
-static BACKEND_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Backend mode: 0 = Vulkan preferred with GL fallback (default), 1 = GL only.
+/// Only read when the player is constructed; see `set_backend_mode`.
+static BACKEND_MODE: AtomicU8 = AtomicU8::new(0);
 
-// ✅ 멀티터치 지원: 포인터 ID별로 터치 시작점과 마우스 위치 추적
-lazy_static! {
-    static ref TOUCH_STARTS: Mutex<HashMap<usize, (f64, f64)>> = Mutex::new(HashMap::new());
-    static ref MOUSE_POS_AT_TOUCH_STARTS: Mutex<HashMap<usize, (f64, f64)>> = Mutex::new(HashMap::new());
+/// Set once the renderer has been built, after which `BACKEND_MODE` no longer
+/// has any effect on the running player.
+static BACKEND_LOCKED_IN: AtomicBool = AtomicBool::new(false);
+
+/// Per-pointer touch origin and cursor-at-touch-origin, for Relative Swipe
+/// mode. Keyed by `Pointer::pointer_id()`, which is stable for the lifetime of
+/// a finger -- unlike the pointer *index*, which shifts as fingers lift.
+static TOUCH_STARTS: LazyLock<Mutex<HashMap<i32, (f64, f64)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static MOUSE_POS_AT_TOUCH_STARTS: LazyLock<Mutex<HashMap<i32, (f64, f64)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Touch click enabled: true = touch emits MouseDown/MouseUp, false = move only.
+static TOUCH_CLICK_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Pause state: true = paused, false = playing.
+static IS_PAUSED: AtomicBool = AtomicBool::new(false);
+
+/// Reset the transient player state that must not leak between `run()` calls.
+///
+/// The `.so` is never unloaded, so these statics outlive an Activity. Without
+/// this, a second launch in the same process would start with a stale cursor,
+/// stale touch origins, and `CONTENT_READY_NOTIFIED` already set -- which
+/// suppressed `onContentReady()` entirely on every launch after the first.
+///
+/// Host configuration is deliberately left alone; see the comment at the end.
+fn reset_player_state() {
+    CONTENT_READY_NOTIFIED.store(false, Ordering::SeqCst);
+    IS_PAUSED.store(false, Ordering::SeqCst);
+    *lock_poison_tolerant(&LAST_MOUSE_POSITION) = None;
+    lock_poison_tolerant(&TOUCH_STARTS).clear();
+    lock_poison_tolerant(&MOUSE_POS_AT_TOUCH_STARTS).clear();
+    // A new renderer is about to be built, so the backend choice is live again.
+    BACKEND_LOCKED_IN.store(false, Ordering::SeqCst);
+
+    // MOUSE_MODE, TOUCH_CLICK_ENABLED and BACKEND_MODE are host *configuration*,
+    // not player state, and the host may set them before run() starts (as the
+    // reference Activity does for the backend). Resetting them here would
+    // silently discard that.
 }
 
-// Touch click enabled: true = mouse click events on touch, false = only mouse move
-static TOUCH_CLICK_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// These statics are only ever touched from the event-loop thread, so a
+/// poisoned lock carries no cross-thread inconsistency worth propagating.
+fn lock_poison_tolerant<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
-// Pause state: true = paused, false = playing
-static IS_PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The last known cursor position, or `None` if the surface was never touched.
+fn last_mouse_position() -> Option<(f64, f64)> {
+    *lock_poison_tolerant(&LAST_MOUSE_POSITION)
+}
+
+fn set_last_mouse_position(pos: (f64, f64)) {
+    *lock_poison_tolerant(&LAST_MOUSE_POSITION) = Some(pos);
+}
+
+/// Re-send the cursor position to the player.
+///
+/// Ruffle drops into touch mode and hides the cursor after non-pointer input,
+/// so virtual-mouse and menu interactions have to re-prime the hover state.
+/// No-op until the surface has actually been touched.
+fn reprime_cursor(player: &Mutex<Player>) {
+    if let Some((x, y)) = last_mouse_position() {
+        lock_poison_tolerant(player).handle_event(PlayerEvent::MouseMove { x, y });
+    }
+}
+
+/// Tell Java the content is ready, at most once per movie.
+///
+/// Must be called with no player lock held: this re-enters the JVM, and a host
+/// implementation that calls back into a native method needing the player
+/// would otherwise deadlock. It also runs on the event-loop thread, not the
+/// main thread, so the host has to post to its own looper before touching UI.
+fn notify_content_ready_once() {
+    if CONTENT_READY_NOTIFIED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    match get_jvm() {
+        Ok((jvm, activity)) => match jvm.attach_current_thread() {
+            Ok(mut env) => {
+                JavaInterface::on_content_ready(&mut env, &activity);
+                log::info!("Notified Java that content is ready");
+            }
+            Err(e) => {
+                // Let a later tick retry rather than losing the signal.
+                CONTENT_READY_NOTIFIED.store(false, Ordering::SeqCst);
+                log::warn!("Could not attach thread to notify content ready: {e}");
+            }
+        },
+        Err(e) => {
+            CONTENT_READY_NOTIFIED.store(false, Ordering::SeqCst);
+            log::warn!("JVM unavailable to notify content ready: {e}");
+        }
+    }
+}
+
+/// Post an event to the event loop via `PlayerActivity.eventLoopHandle`.
+///
+/// Returns whether the event was queued. Every JNI entry point must go through
+/// this rather than unwrapping `get_rust_field`: `run()` takes the field back
+/// during teardown, so a host calling in from `onPause`/`onDestroy` races that
+/// window -- and a panic there would unwind out of `extern "C"` and abort the
+/// whole process instead of failing one call.
+///
+/// # Safety
+/// `this` must be the `PlayerActivity` whose `eventLoopHandle` was set by
+/// `run()`, as for `JNIEnv::get_rust_field`.
+unsafe fn post_event(env: &mut JNIEnv, this: &JObject, event: RuffleEvent) -> bool {
+    // Resolve the borrow of `env` before touching it again on the error path.
+    let outcome = match env.get_rust_field::<_, _, Sender<RuffleEvent>>(this, "eventLoopHandle") {
+        Ok(event_loop) => Ok(event_loop.send(event).is_ok()),
+        Err(e) => Err(e.to_string()),
+    };
+
+    match outcome {
+        Ok(queued) => queued,
+        Err(msg) => {
+            // A failed field lookup can leave a pending exception; clear it so
+            // the next JNI call on this thread is not poisoned by it.
+            let _ = env.exception_clear();
+            log::warn!("Event loop unavailable, dropping event: {msg}");
+            false
+        }
+    }
+}
 
 #[tokio::main]
 async fn run(app: AndroidApp) {
@@ -172,9 +291,10 @@ async fn run(app: AndroidApp) {
     let trace_output;
     let android_storage_dir;
 
-    // 게임 시작 시 pause 상태 초기화 (재시작 시에도 올바르게 동작하도록)
-    IS_PAUSED.store(false, std::sync::atomic::Ordering::Relaxed);
-    log::info!("Pause state initialized to: playing");
+    // The .so outlives the Activity, so clear everything a previous run left
+    // behind before starting a new one.
+    reset_player_state();
+    log::info!("Player state reset: playing, cursor unknown");
 
     unsafe {
         let vm = JavaVM::from_raw(app.vm_as_ptr() as *mut sys::JavaVM).expect("JVM must exist");
@@ -307,35 +427,71 @@ async fn run(app: AndroidApp) {
                                     )
                                     .unwrap();
                                 }
-                                player_lock.set_is_playing(true);
+                                // Respect an explicit pause across surface recreation
+                                // (background -> foreground, rotation). Resuming
+                                // unconditionally here would leave IS_PAUSED set while
+                                // the movie runs, so the next togglePause() would
+                                // "pause" by resuming.
+                                let paused = IS_PAUSED.load(Ordering::SeqCst);
+                                player_lock.set_is_playing(!paused);
                             } else {
-                                // Get backend mode: 0 = VULKAN (default), 1 = GL
-                                let backend_mode = BACKEND_MODE.load(std::sync::atomic::Ordering::Relaxed);
+                                // Backend mode: 0 = Vulkan preferred (default), 1 = GL only.
+                                // Vulkan is materially faster on modern Android, but it is
+                                // not universally available (old drivers, blocklists, some
+                                // emulators), so mode 0 keeps GL in the mask as a fallback
+                                // rather than turning a missing adapter into an abort.
+                                let backend_mode = BACKEND_MODE.load(Ordering::SeqCst);
+                                BACKEND_LOCKED_IN.store(true, Ordering::SeqCst);
                                 let backend = if backend_mode == 1 {
                                     wgpu::Backends::GL
                                 } else {
-                                    wgpu::Backends::VULKAN
+                                    wgpu::Backends::VULKAN | wgpu::Backends::GL
                                 };
                                 log::info!("Using backend: {:?}", backend);
-                                
+
+                                // SurfaceTargetUnsafe is not Clone, so build a fresh
+                                // one per attempt.
+                                let surface_target = || wgpu::SurfaceTargetUnsafe::RawHandle {
+                                    raw_display_handle: Some(RawDisplayHandle::Android(
+                                        AndroidDisplayHandle::new(),
+                                    )),
+                                    raw_window_handle: window
+                                        .window_handle()
+                                        .expect("native window must expose a raw handle")
+                                        .into(),
+                                };
+
                                 let renderer = unsafe {
                                     // TODO: make this take an Arc<Window> instead?
-                                    WgpuRenderBackend::for_window_unsafe(
-                                        wgpu::SurfaceTargetUnsafe::RawHandle {
-                                            raw_display_handle: Some(RawDisplayHandle::Android(
-                                                AndroidDisplayHandle::new(),
-                                            )),
-                                            raw_window_handle: window
-                                                .window_handle()
-                                                .unwrap()
-                                                .into(),
-                                        },
+                                    let attempt = WgpuRenderBackend::for_window_unsafe(
+                                        surface_target(),
                                         (dimensions.width, dimensions.height),
                                         backend,
                                         wgpu::PowerPreference::HighPerformance,
                                         None,
-                                    )
-                                    .unwrap()
+                                    );
+                                    match attempt {
+                                        Ok(renderer) => renderer,
+                                        Err(e) if backend != wgpu::Backends::GL => {
+                                            // Degrade instead of aborting the process: a
+                                            // panic here would unwind out of extern "C".
+                                            log::warn!(
+                                                "Renderer creation with {backend:?} failed ({e}); retrying with GL only"
+                                            );
+                                            WgpuRenderBackend::for_window_unsafe(
+                                                surface_target(),
+                                                (dimensions.width, dimensions.height),
+                                                wgpu::Backends::GL,
+                                                wgpu::PowerPreference::HighPerformance,
+                                                None,
+                                            )
+                                            .expect("GL fallback renderer creation failed")
+                                        }
+                                        Err(e) => {
+                                            // edition 2018: panic! takes no implicit args.
+                                            panic!("Renderer creation with {:?} failed: {}", backend, e)
+                                        }
+                                    }
                                 };
                                 let movie_url = Url::parse("file://movie.swf").unwrap();
                                 let player_id = PlayerId::new();
@@ -385,25 +541,11 @@ async fn run(app: AndroidApp) {
                                     player_lock.mutate_with_update_context(|context| {
                                         context.set_root_movie(movie);
                                     });
-                                    // Reset notification flag when new SWF is loaded
-                                    CONTENT_READY_NOTIFIED.store(false, std::sync::atomic::Ordering::Relaxed);
-
-                                    // Notify Java that content is loaded and ready
-                                    let (jvm, activity) = get_jvm().unwrap();
-                                    let mut env = jvm.attach_current_thread().unwrap();
-                                    JavaInterface::on_content_ready(&mut env, &activity);
-                                    log::info!("Notified Java that SWF content is ready");
+                                    // Notifying happens once, from the tick loop
+                                    // below, after this lock is released -- see
+                                    // notify_content_ready_once().
                                 } else {
-                                    player_lock.fetch_root_movie(url, Vec::new(), Box::new(|_| {
-                                        // Notify Java that content is loaded and ready when fetched
-                                        let (_jvm, _activity) = get_jvm().unwrap();
-                                        if let Ok((jvm, activity)) = get_jvm() {
-                                            if let Ok(mut env) = jvm.attach_current_thread() {
-                                                JavaInterface::on_content_ready(&mut env, &activity);
-                                                log::info!("Notified Java that fetched SWF content is ready");
-                                            }
-                                        }
-                                    }))
+                                    player_lock.fetch_root_movie(url, Vec::new(), Box::new(|_| {}))
                                 }
                                 player_lock.set_is_playing(true); // Desktop player will auto-play.
 
@@ -427,81 +569,105 @@ async fn run(app: AndroidApp) {
                                 while inputs.next(|input| match input {
                                     InputEvent::MotionEvent(event) => {
                                         let window = native_window.as_ref().unwrap();
-                                        let pointer_index = event.pointer_index();
-                                        let pointer = event.pointer_at_index(pointer_index);
                                         let coords: (i32, i32) = get_loc_in_window();
-                                        let touch_x = pointer.x() as f64 - coords.0 as f64;
-                                        let touch_y = pointer.y() as f64 - coords.1 as f64;
                                         let view_size = get_view_size().unwrap();
-                                        let scaled_touch_x = touch_x * window.width() as f64 / view_size.0 as f64;
-                                        let scaled_touch_y = touch_y * window.height() as f64 / view_size.1 as f64;
-                                        
-                                        // Check mouse mode: 0 = Direct Touch, 1 = Relative Swipe
-                                        let mouse_mode = MOUSE_MODE.load(std::sync::atomic::Ordering::Relaxed);
-                                        
-                                        // ✅ 멀티터치 지원: 포인터 ID 사용
-                                        let pointer_id = pointer_index; // pointer_index를 ID로 사용
-                                        
-                                        let (mouse_x, mouse_y) = if mouse_mode == 0 {
-                                            // Direct Touch mode: mouse position = touch position
-                                            (scaled_touch_x, scaled_touch_y)
-                                        } else {
-                                            // Relative Swipe mode: calculate relative movement per pointer
-                                            match event.action() {
-                                                MotionAction::Down | MotionAction::PointerDown | MotionAction::ButtonPress => {
-                                                    // ✅ Store touch start position for this pointer
-                                                    if let Ok(mut touch_starts) = TOUCH_STARTS.lock() {
-                                                        touch_starts.insert(pointer_id, (scaled_touch_x, scaled_touch_y));
-                                                    }
-                                                    // ✅ Store current mouse position for this pointer
-                                                    if let Ok(mut mouse_at_starts) = MOUSE_POS_AT_TOUCH_STARTS.lock() {
-                                                        if let Ok(last_pos) = LAST_MOUSE_POSITION.lock() {
-                                                            mouse_at_starts.insert(pointer_id, *last_pos);
-                                                        }
-                                                    }
-                                                    // Return current mouse position (no movement on touch down)
-                                                    LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone()
-                                                }
-                                                MotionAction::Move => {
-                                                    // ✅ Calculate relative movement from this pointer's touch start
-                                                    let touch_starts = TOUCH_STARTS.lock().unwrap_or_else(|e| e.into_inner());
-                                                    if let Some(&(start_x, start_y)) = touch_starts.get(&pointer_id) {
-                                                        let delta_x = scaled_touch_x - start_x;
-                                                        let delta_y = scaled_touch_y - start_y;
-                                                        
-                                                        let mouse_at_starts = MOUSE_POS_AT_TOUCH_STARTS.lock().unwrap_or_else(|e| e.into_inner());
-                                                        let mouse_at_start = mouse_at_starts.get(&pointer_id).copied().unwrap_or((0.0, 0.0));
-                                                        
-                                                        let new_x = (mouse_at_start.0 + delta_x).max(0.0).min(window.width() as f64);
-                                                        let new_y = (mouse_at_start.1 + delta_y).max(0.0).min(window.height() as f64);
-                                                        (new_x, new_y)
-                                                    } else {
-                                                        LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone()
-                                                    }
-                                                }
-                                                MotionAction::Up | MotionAction::PointerUp | MotionAction::ButtonRelease => {
-                                                    // ✅ Clear touch start for this pointer
-                                                    if let Ok(mut touch_starts) = TOUCH_STARTS.lock() {
-                                                        touch_starts.remove(&pointer_id);
-                                                    }
-                                                    if let Ok(mut mouse_at_starts) = MOUSE_POS_AT_TOUCH_STARTS.lock() {
-                                                        mouse_at_starts.remove(&pointer_id);
-                                                    }
-                                                    // Return current mouse position
-                                                    LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone()
-                                                }
-                                                _ => LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone()
+                                        let action = event.action();
+                                        // Mouse mode: 0 = Direct Touch, 1 = Relative Swipe
+                                        let mouse_mode = MOUSE_MODE.load(Ordering::Relaxed);
+
+                                        // Ruffle has a single cursor, so exactly one pointer
+                                        // drives it. For down/up that is the pointer the
+                                        // action refers to. For Move, `pointer_index()` is
+                                        // always 0 and identifies nothing, so follow the
+                                        // finger whose swipe is already being tracked.
+                                        let (pointer_id, raw_x, raw_y) = {
+                                            let acted_on = event.pointer_at_index(event.pointer_index());
+                                            let fallback =
+                                                (acted_on.pointer_id(), acted_on.x(), acted_on.y());
+                                            if action == MotionAction::Move && mouse_mode != 0 {
+                                                let tracked = lock_poison_tolerant(&TOUCH_STARTS);
+                                                event
+                                                    .pointers()
+                                                    .find(|p| tracked.contains_key(&p.pointer_id()))
+                                                    .map(|p| (p.pointer_id(), p.x(), p.y()))
+                                                    .unwrap_or(fallback)
+                                            } else {
+                                                fallback
                                             }
                                         };
-                                        
-                                        // Update last mouse position
-                                        if let Ok(mut pos) = LAST_MOUSE_POSITION.lock() {
-                                            *pos = (mouse_x, mouse_y);
-                                        }
-                                        
+
+                                        let scaled_touch_x = (raw_x as f64 - coords.0 as f64)
+                                            * window.width() as f64
+                                            / view_size.0 as f64;
+                                        let scaled_touch_y = (raw_y as f64 - coords.1 as f64)
+                                            * window.height() as f64
+                                            / view_size.1 as f64;
+
+                                        let (mouse_x, mouse_y) = if mouse_mode == 0 {
+                                            // Direct Touch mode: cursor jumps to the finger.
+                                            (scaled_touch_x, scaled_touch_y)
+                                        } else {
+                                            // Relative Swipe mode: cursor accumulates the
+                                            // delta from this finger's touch origin, so the
+                                            // surface behaves like a trackpad.
+                                            match action {
+                                                MotionAction::Down
+                                                | MotionAction::PointerDown
+                                                | MotionAction::ButtonPress => {
+                                                    // Anchor this finger: remember where it
+                                                    // went down and where the cursor was.
+                                                    let anchor = last_mouse_position()
+                                                        .unwrap_or((scaled_touch_x, scaled_touch_y));
+                                                    lock_poison_tolerant(&TOUCH_STARTS)
+                                                        .insert(pointer_id, (scaled_touch_x, scaled_touch_y));
+                                                    lock_poison_tolerant(&MOUSE_POS_AT_TOUCH_STARTS)
+                                                        .insert(pointer_id, anchor);
+                                                    // Touching down must not move the cursor.
+                                                    anchor
+                                                }
+                                                MotionAction::Move => {
+                                                    let start = lock_poison_tolerant(&TOUCH_STARTS)
+                                                        .get(&pointer_id)
+                                                        .copied();
+                                                    match start {
+                                                        Some((start_x, start_y)) => {
+                                                            let anchor =
+                                                                lock_poison_tolerant(&MOUSE_POS_AT_TOUCH_STARTS)
+                                                                    .get(&pointer_id)
+                                                                    .copied()
+                                                                    .or_else(last_mouse_position)
+                                                                    .unwrap_or((start_x, start_y));
+                                                            let x = (anchor.0 + scaled_touch_x - start_x)
+                                                                .clamp(0.0, window.width() as f64);
+                                                            let y = (anchor.1 + scaled_touch_y - start_y)
+                                                                .clamp(0.0, window.height() as f64);
+                                                            (x, y)
+                                                        }
+                                                        // Untracked finger: leave the cursor be.
+                                                        None => last_mouse_position()
+                                                            .unwrap_or((scaled_touch_x, scaled_touch_y)),
+                                                    }
+                                                }
+                                                MotionAction::Up
+                                                | MotionAction::PointerUp
+                                                | MotionAction::ButtonRelease => {
+                                                    lock_poison_tolerant(&TOUCH_STARTS)
+                                                        .remove(&pointer_id);
+                                                    lock_poison_tolerant(&MOUSE_POS_AT_TOUCH_STARTS)
+                                                        .remove(&pointer_id);
+                                                    last_mouse_position()
+                                                        .unwrap_or((scaled_touch_x, scaled_touch_y))
+                                                }
+                                                _ => last_mouse_position()
+                                                    .unwrap_or((scaled_touch_x, scaled_touch_y)),
+                                            }
+                                        };
+
+                                        set_last_mouse_position((mouse_x, mouse_y));
+
                                         // Check if touch click is enabled
-                                        let touch_click_enabled = TOUCH_CLICK_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
-                                        
+                                        let touch_click_enabled = TOUCH_CLICK_ENABLED.load(Ordering::Relaxed);
+
                                         let ruffle_event = match event.action() {
                                             MotionAction::Down | MotionAction::PointerDown | MotionAction::ButtonPress => {
                                                 if touch_click_enabled {
@@ -611,12 +777,9 @@ async fn run(app: AndroidApp) {
                 key_descriptor,
             }) => {
                 if let Some(player) = playerbox.as_ref() {
-                    // 키 이벤트 전에 MouseMove를 보내서 마우스 위치 확인
-                    let (x, y) = LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    if x != 0.0 || y != 0.0 {
-                        player.player.lock().unwrap().handle_event(PlayerEvent::MouseMove { x, y });
-                    }
-                    
+                    // Keep the cursor primed around the key event.
+                    reprime_cursor(&player.player);
+
                     let event = if down {
                         PlayerEvent::KeyDown {
                             key: key_descriptor,
@@ -635,26 +798,21 @@ async fn run(app: AndroidApp) {
                             player.player.lock().unwrap().handle_event(event);
                         }
                     }
-                    
-                    // 키 이벤트 후에도 MouseMove를 보내서 마우스 모드 유지
-                    // 특히 up 이벤트 후에 중요!
-                    if x != 0.0 || y != 0.0 {
-                        player.player.lock().unwrap().handle_event(PlayerEvent::MouseMove { x, y });
-                    }
-                    
+
+                    // Re-prime after the key event too -- matters most after key up.
+                    reprime_cursor(&player.player);
+
                     needs_redraw = true;
                 }
             }
             Ok(RuffleEvent::VirtualMouseEvent { down, button }) => {
                 if let Some(player) = playerbox.as_ref() {
-                    // Get the last mouse position
-                    let (x, y) = LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    
-                    if x != 0.0 || y != 0.0 {
-                        // 이벤트 전에 MouseMove를 보내서 마우스 위치 확인
-                        player.player.lock().unwrap().handle_event(PlayerEvent::MouseMove { x, y });
-                        
-                        // MouseDown 또는 MouseUp 이벤트 보냄
+                    // A virtual click needs somewhere to click. Before the surface
+                    // has ever been touched there is no cursor position, so there
+                    // is nothing meaningful to dispatch.
+                    if let Some((x, y)) = last_mouse_position() {
+                        reprime_cursor(&player.player);
+
                         let event = if down {
                             PlayerEvent::MouseDown {
                                 x,
@@ -663,19 +821,14 @@ async fn run(app: AndroidApp) {
                                 index: None,
                             }
                         } else {
-                            PlayerEvent::MouseUp {
-                                x,
-                                y,
-                                button,
-                            }
+                            PlayerEvent::MouseUp { x, y, button }
                         };
                         player.player.lock().unwrap().handle_event(event);
 
-                        // 이벤트 후에도 MouseMove를 보내서 마우스 모드 유지
-                        // 특히 up 이벤트 후에 중요!
-                        player.player.lock().unwrap().handle_event(PlayerEvent::MouseMove { x, y });
+                        // Re-prime after the click too -- matters most after mouse up.
+                        reprime_cursor(&player.player);
                     }
-                    
+
                     needs_redraw = true;
                 }
             }
@@ -686,26 +839,20 @@ async fn run(app: AndroidApp) {
                         .lock()
                         .unwrap()
                         .run_context_menu_callback(index);
-                    
-                    // 컨텍스트 메뉴 선택 후에도 마우스 모드 유지
-                    let (x, y) = LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    if x != 0.0 || y != 0.0 {
-                        player.player.lock().unwrap().handle_event(PlayerEvent::MouseMove { x, y });
-                    }
-                    
+
+                    // Keep the cursor primed after the menu selection.
+                    reprime_cursor(&player.player);
+
                     needs_redraw = true;
                 }
             }
             Ok(RuffleEvent::ClearContextMenu) => {
                 if let Some(player) = playerbox.as_ref() {
                     player.player.lock().unwrap().clear_custom_menu_items();
-                    
-                    // 컨텍스트 메뉴 닫기 후에도 마우스 모드 유지
-                    let (x, y) = LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    if x != 0.0 || y != 0.0 {
-                        player.player.lock().unwrap().handle_event(PlayerEvent::MouseMove { x, y });
-                    }
-                    
+
+                    // Keep the cursor primed after closing the menu.
+                    reprime_cursor(&player.player);
+
                     needs_redraw = true;
                 }
             }
@@ -716,26 +863,23 @@ async fn run(app: AndroidApp) {
                     let (jvm, activity) = get_jvm().unwrap();
                     let mut env = jvm.attach_current_thread().unwrap();
                     JavaInterface::show_context_menu(&mut env, &activity, &items);
-                    
-                    // 컨텍스트 메뉴 요청 후에도 마우스 모드 유지
-                    let (x, y) = LAST_MOUSE_POSITION.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    if x != 0.0 || y != 0.0 {
-                        player.player.lock().unwrap().handle_event(PlayerEvent::MouseMove { x, y });
-                    }
-                    
+
+                    // Keep the cursor primed after requesting the menu.
+                    reprime_cursor(&player.player);
+
                     needs_redraw = true;
                 }
             }
             Ok(RuffleEvent::TogglePause) => {
                 if let Some(player) = playerbox.as_ref() {
-                    let is_paused = IS_PAUSED.load(std::sync::atomic::Ordering::Relaxed);
-                    let new_state = !is_paused;
-                    IS_PAUSED.store(new_state, std::sync::atomic::Ordering::Relaxed);
+                    // The flag was already flipped by the JNI entry point; this
+                    // only applies it. Reading it here (rather than toggling
+                    // again) also keeps repeated taps idempotent if several
+                    // events coalesce.
+                    let paused = IS_PAUSED.load(Ordering::SeqCst);
+                    lock_poison_tolerant(&player.player).set_is_playing(!paused);
 
-                    let mut player_lock = player.player.lock().unwrap();
-                    player_lock.set_is_playing(!new_state);
-
-                    log::info!("Game {}", if new_state { "paused" } else { "resumed" });
+                    log::info!("Game {}", if paused { "paused" } else { "resumed" });
                     needs_redraw = true;
                 }
             }
@@ -759,6 +903,7 @@ async fn run(app: AndroidApp) {
         if dt > 0 {
             last_frame_time = new_time;
             if let Some(player) = playerbox.as_ref() {
+                let mut content_ready = false;
                 if let Ok(mut player) = player.player.lock() {
                     player.tick(FloatDuration::from_millis(dt as f64 / 1000.0));
                     next_frame_time = Some(new_time + player.time_til_next_frame());
@@ -767,22 +912,11 @@ async fn run(app: AndroidApp) {
                         <dyn Any>::downcast_mut::<AAudioAudioBackend>(player.audio_mut()).unwrap();
                     audio.recreate_stream_if_needed();
 
-                    // Check if content is ready based on player state
-                    if player.is_playing() {
-                        // Check if we need to notify Java that content is ready
-                        let already_notified = CONTENT_READY_NOTIFIED.load(std::sync::atomic::Ordering::Relaxed);
-
-                        if !already_notified {
-                            log::info!("Content appears to be ready (playing), notifying Java");
-                            if let Ok((jvm, activity)) = get_jvm() {
-                                if let Ok(mut env) = jvm.attach_current_thread() {
-                                    JavaInterface::on_content_ready(&mut env, &activity);
-                                    log::info!("Notified Java that content is ready");
-                                    CONTENT_READY_NOTIFIED.store(true, std::sync::atomic::Ordering::Relaxed);
-                                }
-                            }
-                        }
-                    }
+                    content_ready = player.is_playing();
+                }
+                // Deliberately outside the lock above.
+                if content_ready {
+                    notify_content_ready_once();
                 }
             } else {
                 next_frame_time = None;
@@ -821,13 +955,15 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_keydown(
         .expect("Couldn't get java string!")
         .into();
 
-    let event_loop: MutexGuard<Sender<RuffleEvent>> =
-        env.get_rust_field(this, "eventLoopHandle").unwrap();
     if let Some(desc) = key_tag_to_key_descriptor(&tag) {
-        let _ = event_loop.send(RuffleEvent::VirtualKeyEvent {
-            down: true,
-            key_descriptor: desc,
-        });
+        post_event(
+            &mut env,
+            &this,
+            RuffleEvent::VirtualKeyEvent {
+                down: true,
+                key_descriptor: desc,
+            },
+        );
     }
 }
 
@@ -843,13 +979,15 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_keyup(
         .expect("Couldn't get java string!")
         .into();
 
-    let event_loop: MutexGuard<Sender<RuffleEvent>> =
-        env.get_rust_field(this, "eventLoopHandle").unwrap();
     if let Some(desc) = key_tag_to_key_descriptor(&tag) {
-        let _ = event_loop.send(RuffleEvent::VirtualKeyEvent {
-            down: false,
-            key_descriptor: desc,
-        });
+        post_event(
+            &mut env,
+            &this,
+            RuffleEvent::VirtualKeyEvent {
+                down: false,
+                key_descriptor: desc,
+            },
+        );
     }
 }
 
@@ -860,13 +998,15 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_keydownByCode(
     this: JObject,
     keycode: jint,
 ) {
-    let event_loop: MutexGuard<Sender<RuffleEvent>> =
-        env.get_rust_field(this, "eventLoopHandle").unwrap();
     if let Some(desc) = keycode_to_key_descriptor(keycode) {
-        let _ = event_loop.send(RuffleEvent::VirtualKeyEvent {
-            down: true,
-            key_descriptor: desc,
-        });
+        post_event(
+            &mut env,
+            &this,
+            RuffleEvent::VirtualKeyEvent {
+                down: true,
+                key_descriptor: desc,
+            },
+        );
     }
 }
 
@@ -877,13 +1017,15 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_keyupByCode(
     this: JObject,
     keycode: jint,
 ) {
-    let event_loop: MutexGuard<Sender<RuffleEvent>> =
-        env.get_rust_field(this, "eventLoopHandle").unwrap();
     if let Some(desc) = keycode_to_key_descriptor(keycode) {
-        let _ = event_loop.send(RuffleEvent::VirtualKeyEvent {
-            down: false,
-            key_descriptor: desc,
-        });
+        post_event(
+            &mut env,
+            &this,
+            RuffleEvent::VirtualKeyEvent {
+                down: false,
+                key_descriptor: desc,
+            },
+        );
     }
 }
 
@@ -905,12 +1047,14 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_mousedown(
     this: JObject,
     button_code: jint,
 ) {
-    let event_loop: MutexGuard<Sender<RuffleEvent>> =
-        env.get_rust_field(this, "eventLoopHandle").unwrap();
-    let _ = event_loop.send(RuffleEvent::VirtualMouseEvent {
-        down: true,
-        button: button_code_to_mouse_button(button_code),
-    });
+    post_event(
+        &mut env,
+        &this,
+        RuffleEvent::VirtualMouseEvent {
+            down: true,
+            button: button_code_to_mouse_button(button_code),
+        },
+    );
 }
 
 #[no_mangle]
@@ -920,12 +1064,14 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_mouseup(
     this: JObject,
     button_code: jint,
 ) {
-    let event_loop: MutexGuard<Sender<RuffleEvent>> =
-        env.get_rust_field(this, "eventLoopHandle").unwrap();
-    let _ = event_loop.send(RuffleEvent::VirtualMouseEvent {
-        down: false,
-        button: button_code_to_mouse_button(button_code),
-    });
+    post_event(
+        &mut env,
+        &this,
+        RuffleEvent::VirtualMouseEvent {
+            down: false,
+            button: button_code_to_mouse_button(button_code),
+        },
+    );
 }
 
 pub fn get_jvm<'a>() -> Result<(jni::JavaVM, JObject<'a>), Box<dyn std::error::Error>> {
@@ -943,9 +1089,7 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_requestContextMenu(
     mut env: JNIEnv,
     this: JObject,
 ) {
-    let event_loop: MutexGuard<Sender<RuffleEvent>> =
-        env.get_rust_field(this, "eventLoopHandle").unwrap();
-    let _ = event_loop.send(RuffleEvent::RequestContextMenu);
+    post_event(&mut env, &this, RuffleEvent::RequestContextMenu);
 }
 
 #[no_mangle]
@@ -955,9 +1099,11 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_runContextMenuCallback(
     this: JObject,
     index: jint,
 ) {
-    let event_loop: MutexGuard<Sender<RuffleEvent>> =
-        env.get_rust_field(this, "eventLoopHandle").unwrap();
-    let _ = event_loop.send(RuffleEvent::RunContextMenuCallback(index as usize));
+    post_event(
+        &mut env,
+        &this,
+        RuffleEvent::RunContextMenuCallback(index as usize),
+    );
 }
 
 #[no_mangle]
@@ -966,9 +1112,7 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_clearContextMenu(
     mut env: JNIEnv,
     this: JObject,
 ) {
-    let event_loop: MutexGuard<Sender<RuffleEvent>> =
-        env.get_rust_field(this, "eventLoopHandle").unwrap();
-    let _ = event_loop.send(RuffleEvent::ClearContextMenu);
+    post_event(&mut env, &this, RuffleEvent::ClearContextMenu);
 }
 
 #[no_mangle]
@@ -979,8 +1123,20 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_setMouseMode(
     mode: jint,
 ) {
     // mode: 0 = Direct Touch, 1 = Relative Swipe
-    MOUSE_MODE.store(mode as u8, std::sync::atomic::Ordering::Relaxed);
-    log::info!("Mouse mode changed to: {}", if mode == 0 { "Direct Touch" } else { "Relative Swipe" });
+    match mode {
+        0 | 1 => {
+            MOUSE_MODE.store(mode as u8, Ordering::Relaxed);
+            log::info!(
+                "Mouse mode: {}",
+                if mode == 0 {
+                    "Direct Touch"
+                } else {
+                    "Relative Swipe"
+                }
+            );
+        }
+        other => log::warn!("Ignoring unknown mouse mode {other}; expected 0 or 1"),
+    }
 }
 
 #[no_mangle]
@@ -992,8 +1148,11 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_setTouchClickEnabled(
 ) {
     // enabled: 0 = disabled (only mouse move), 1 = enabled (mouse click on touch)
     let is_enabled = enabled != 0;
-    TOUCH_CLICK_ENABLED.store(is_enabled, std::sync::atomic::Ordering::Relaxed);
-    log::info!("Touch click events: {}", if is_enabled { "enabled" } else { "disabled" });
+    TOUCH_CLICK_ENABLED.store(is_enabled, Ordering::Relaxed);
+    log::info!(
+        "Touch click events: {}",
+        if is_enabled { "enabled" } else { "disabled" }
+    );
 }
 
 #[no_mangle]
@@ -1003,20 +1162,44 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_setBackendMode(
     _this: JObject,
     mode: jint,
 ) {
-    // mode: 0 = VULKAN (default), 1 = GL
-    BACKEND_MODE.store(mode as u8, std::sync::atomic::Ordering::Relaxed);
-    log::info!("Backend mode changed to: {}", if mode == 1 { "GL" } else { "VULKAN" });
+    // mode: 0 = Vulkan preferred (GL fallback), 1 = GL only
+    match mode {
+        0 | 1 => {
+            BACKEND_MODE.store(mode as u8, Ordering::SeqCst);
+            let name = if mode == 1 {
+                "GL only"
+            } else {
+                "Vulkan preferred"
+            };
+            if BACKEND_LOCKED_IN.load(Ordering::SeqCst) {
+                // The renderer reads this once, at construction. Storing it is
+                // still worthwhile: a restart in this process picks it up.
+                log::warn!("Backend mode set to {name}, but the renderer already exists -- takes effect on next start");
+            } else {
+                log::info!("Backend mode: {name}");
+            }
+        }
+        other => log::warn!("Ignoring unknown backend mode {other}; expected 0 or 1"),
+    }
 }
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_togglePause(
-    mut env: JNIEnv,
-    this: JObject,
-) {
-    let event_loop: MutexGuard<Sender<RuffleEvent>> =
-        env.get_rust_field(this, "eventLoopHandle").unwrap();
-    let _ = event_loop.send(RuffleEvent::TogglePause);
+pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_togglePause(mut env: JNIEnv, this: JObject) {
+    // Flip the flag here, synchronously, so a host that calls isPaused()
+    // straight after this gets the new state. Applying it to the player has to
+    // happen on the event-loop thread, and that lags by at least one loop
+    // iteration -- the loop drains one event per iteration -- so deciding the
+    // new state over there would make isPaused() report the pre-toggle value.
+    let paused = !IS_PAUSED.fetch_xor(true, Ordering::SeqCst);
+    log::info!(
+        "Pause requested: {}",
+        if paused { "paused" } else { "playing" }
+    );
+
+    // If the loop is already gone the flag still reflects intent, and
+    // InitWindow honours it if a player comes back.
+    post_event(&mut env, &this, RuffleEvent::TogglePause);
 }
 
 #[no_mangle]
@@ -1025,9 +1208,7 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_flushSharedObjects(
     mut env: JNIEnv,
     this: JObject,
 ) {
-    let event_loop: MutexGuard<Sender<RuffleEvent>> =
-        env.get_rust_field(this, "eventLoopHandle").unwrap();
-    let _ = event_loop.send(RuffleEvent::FlushSharedObjects);
+    post_event(&mut env, &this, RuffleEvent::FlushSharedObjects);
 }
 
 #[no_mangle]
@@ -1036,7 +1217,7 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_isPaused(
     _env: JNIEnv,
     _this: JObject,
 ) -> jint {
-    if IS_PAUSED.load(std::sync::atomic::Ordering::Relaxed) {
+    if IS_PAUSED.load(Ordering::SeqCst) {
         1
     } else {
         0
@@ -1051,16 +1232,16 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_nativeInit(
     crash_callback: JObject,
 ) {
     let crash_callback_ref = env.new_global_ref(crash_callback).unwrap();
-    
-    // 🛡️ Store Global Reference for cleanup
+
+    // Keep a reference so nativeCleanup() can release it.
     if let Ok(mut stored_ref) = CRASH_CALLBACK_REF.lock() {
         *stored_ref = Some(crash_callback_ref.clone());
     }
-    
+
     let crash_callback = crash_callback_ref;
     let jvm = env.get_java_vm().unwrap();
 
-    // Debug 빌드: 상세한 로그 출력, Release 빌드: 로그 끄기
+    // Debug builds log verbosely; release builds keep warnings and errors.
     #[cfg(debug_assertions)]
     android_logger::init_once(
         android_logger::Config::default()
@@ -1073,10 +1254,18 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_nativeInit(
             ),
     );
 
+    // Release keeps warnings and errors. Turning logging fully off also
+    // silenced the panic hook's `log::error!(target: "panic", ...)`, and with
+    // `[profile.release] strip = "symbols"` that left field crashes with
+    // neither a message nor a symbolized backtrace.
+    //
+    // Note this is keyed on the Cargo profile, not the Android build type:
+    // cargoNdk builds the release profile even for debug APKs, so a debug APK
+    // gets this branch too.
     #[cfg(not(debug_assertions))]
     android_logger::init_once(
         android_logger::Config::default()
-            .with_max_level(log::LevelFilter::Off)
+            .with_max_level(log::LevelFilter::Warn)
             .with_tag("ruffle"),
     );
 
@@ -1127,30 +1316,29 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_nativeInit(
     JavaInterface::init(&mut env, &class)
 }
 
-/// 🛡️ nativeCleanup - JNI Global Reference 해제하여 메모리 누수 방지
-/// Activity.onDestroy()에서 호출되어야 함
+/// Release the JNI global references held for crash reporting.
+///
+/// **The host must call this from `Activity.onDestroy()`.** The panic hook
+/// installed by `nativeInit` captures a `GlobalRef` to the crash callback, and
+/// `CRASH_CALLBACK_REF` holds a second one; neither is released until this
+/// runs, so skipping it keeps the Activity alive for the life of the process.
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_nativeCleanup(
-    _env: JNIEnv,
-    _class: JClass,
-) {
+pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_nativeCleanup(_env: JNIEnv, _class: JClass) {
     log::info!("nativeCleanup called - releasing Global References");
-    
-    // 1. 패닉 핸들러를 기본값으로 되돌림
-    // 이렇게 하면 클로저가 캡처한 crash_callback이 해제됨
+
+    // Dropping the hook releases the crash_callback its closure captured.
     let _ = panic::take_hook();
     log::info!("Panic hook reset to default");
-    
-    // 2. Crash callback Global Reference 해제
+
+    // Then release the copy stored for exactly this purpose.
     if let Ok(mut stored_ref) = CRASH_CALLBACK_REF.lock() {
         if let Some(global_ref) = stored_ref.take() {
-            // Global Reference를 명시적으로 삭제
             drop(global_ref);
             log::info!("Crash callback Global Reference released");
         }
     }
-    
+
     log::info!("nativeCleanup completed successfully");
 }
 
