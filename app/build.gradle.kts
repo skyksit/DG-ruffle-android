@@ -42,15 +42,9 @@ android {
         }
     }
 
-    signingConfigs {
-        create("release") {
-            storeFile = file("skyksit.keystore")
-            storePassword = "***PURGED***"
-            keyAlias = "skyksit"
-            keyPassword = "***PURGED***"
-        }
-    }
-
+    // No signingConfig: this module is a reference/test harness for the JNI
+    // contract, not a shipped app. The deliverable is libruffle_android.so
+    // (see build-so.sh). Release builds here are unsigned on purpose.
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -58,7 +52,6 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = signingConfigs.findByName("release")
         }
     }
 
