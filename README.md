@@ -28,6 +28,125 @@ Please see [CONTRIBUTING.md](CONTRIBUTING.md#building-from-source) for details a
 
 ---
 
+# DGPlayer fork
+
+This is the DGPlayer fork of `ruffle-rs/ruffle-android`. **The Android app in
+this repository is not shipped.** The deliverable is the native library, built
+per ABI, and consumed by a separate host app (`dgplayer-app/dsam3`):
+
+```
+dist/jniLibs/{arm64-v8a,armeabi-v7a,x86,x86_64}/libruffle_android.so
+```
+
+Build it with `./build-so.sh` (see `--help`; needs `cargo-ndk` and an NDK, and
+autodetects the NDK from `local.properties`). `app/` is kept only as the
+reference implementation of the JNI contract below — do not treat it as the
+product.
+
+## Host integration contract
+
+JNI symbols are name-mangled, so the host class must be **exactly
+`rs.ruffle.PlayerActivity`**, based on `GameActivity` (the crate uses
+`android-activity` with the `game-activity` feature). A different package or
+class name will not resolve.
+
+Method resolution is lazy: an `external fun` with no matching symbol throws
+`UnsatisfiedLinkError` at the *first call*, not at load. Conversely, the
+methods Rust looks up are resolved eagerly in `nativeInit`, so a missing
+**required** member kills the process at startup.
+
+### Required members
+
+`JavaInterface::init` (`src/java.rs`) resolves these on the class handed to
+`nativeInit`. Each is `.expect(...)`, so a missing or renamed one aborts:
+
+| Member | JNI signature |
+| --- | --- |
+| `getSurfaceWidth` | `()I` |
+| `getSurfaceHeight` | `()I` |
+| `showContextMenu` | `([Ljava/lang/String;)V` |
+| `getSwfBytes` | `()[B` |
+| `getSwfUri` | `()Ljava/lang/String;` |
+| `getTraceOutput` | `()Ljava/lang/String;` |
+| `getLocInWindow` | `()[I` |
+| `getAndroidDataStorageDir` | `()Ljava/lang/String;` |
+
+Plus the field `private val eventLoopHandle: Long = 0`, which `run()` owns via
+`get_rust_field`/`take_rust_field`.
+
+These are `private` and reachable only through JNI, so if the host ever enables
+R8/minification it must `-keep` them.
+
+### Optional callbacks
+
+Both are looked up with `get_method_id(...).ok()` and the pending
+`NoSuchMethodError` is cleared, so a host without them still starts:
+
+| Callback | JNI signature | Notes |
+| --- | --- | --- |
+| `onContentReady` | `()V` | Fires **once per movie**, when the player starts playing. Called on the **event-loop thread, not the main thread** — post to your own looper before touching views. Do not call back into a native method that locks the player. Note "playing" precedes the first rendered frame, so expect a moment of black if you use it to hide a splash. |
+| `onSharedObjectsFlushed` | `()V` | Completion signal for `flushSharedObjects()`. Fires even when no player existed, so it cannot distinguish "persisted" from "nothing to flush". |
+
+### Native methods to declare
+
+```kotlin
+private external fun keydown(keyTag: String)
+private external fun keyup(keyTag: String)
+private external fun keydownByCode(keycode: Int)   // raw Android KeyEvent keycode
+private external fun keyupByCode(keycode: Int)
+private external fun mousedown(button: Int)        // 0=left, 1=right, 2=middle
+private external fun mouseup(button: Int)
+private external fun requestContextMenu()
+private external fun runContextMenuCallback(index: Int)
+private external fun clearContextMenu()
+private external fun setMouseMode(mode: Int)          // 0=direct touch, 1=relative swipe
+private external fun setTouchClickEnabled(enabled: Int)
+private external fun setBackendMode(mode: Int)        // 0=Vulkan preferred, 1=GL only
+private external fun togglePause()
+private external fun isPaused(): Int                  // 1=paused, 0=playing
+private external fun flushSharedObjects()
+
+companion object {
+    @JvmStatic private external fun nativeInit(crashCallback: CrashCallback)
+    @JvmStatic private external fun nativeCleanup()
+}
+```
+
+### Lifecycle requirements
+
+- **`nativeCleanup()` must be called from `onDestroy()`.** The panic hook
+  installed by `nativeInit` captures a `GlobalRef` to the crash callback and
+  `CRASH_CALLBACK_REF` holds a second one. Neither is released until
+  `nativeCleanup()` runs, so skipping it leaks the Activity for the life of
+  the process.
+- **`setBackendMode()` only takes effect before the renderer is built.** It is
+  read once, when the player is constructed; later calls are stored (so a
+  restart picks them up) and log a warning. Persist the choice yourself if you
+  expose it as a setting.
+- **`flushSharedObjects()` is asynchronous.** It queues the flush; the write
+  happens when the event loop next drains. Calling it from `onPause()` and
+  then being killed can still lose the save — wait for
+  `onSharedObjectsFlushed()` before assuming data is on disk.
+- **`togglePause()` updates the pause flag synchronously**, so `isPaused()`
+  immediately after it reports the new state. Applying it to the player still
+  happens on the event-loop thread. The flag also survives surface recreation,
+  so a paused movie stays paused across background/foreground.
+- **Virtual mouse events need a cursor position.** `mousedown`/`mouseup` are
+  dropped until the surface has been touched at least once, since there is no
+  meaningful place to click before that.
+
+### Behavioural differences from upstream
+
+- Outbound navigation is disabled: `getURL`/`navigateToURL` are logged and
+  ignored rather than opening a browser (`src/navigator.rs`).
+- The default renderer backend is Vulkan with a GL fallback, where upstream
+  hardcodes GL.
+- Release builds log at `warn` and above; debug builds are verbose. Note this
+  keys off the Cargo profile, and `cargoNdk` builds the release profile even
+  for debug APKs.
+
+---
+
 # TODO
 
 In no particular order:
