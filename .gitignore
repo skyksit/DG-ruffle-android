@@ -1,33 +1,24 @@
-*.iml
-.gradle
-/local.properties
-.idea
-.DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
-local.properties
+# Build output
 /target
-/dist
-
-# Gradle files
-.gradle/
+/build
 build/
-
-# Local configuration file (sdk path, etc)
-local.properties
-
-# Log/OS Files
-*.log
-
-# Android Studio generated files and folders
-captures/
-.externalNativeBuild/
-.cxx/
+/dist
 *.aab
 *.apk
 output-metadata.json
+
+# Gradle
+.gradle/
+
+# Local configuration (sdk path, etc)
+local.properties
+
+# NDK / native build
+.externalNativeBuild/
+.cxx/
+
+# Android Studio generated files and folders
+captures/
 
 # IntelliJ
 *.iml
@@ -43,5 +34,9 @@ render.experimental.xml
 # Google Services (e.g. APIs or Firebase)
 google-services.json
 
-# Android Profiling
+# Profiling
 *.hprof
+
+# Log/OS files
+*.log
+.DS_Store
