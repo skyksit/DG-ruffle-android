@@ -20,8 +20,8 @@ pub struct JavaInterface {
     get_trace_output: JMethodID,
     get_loc_in_window: JMethodID,
     get_android_data_storage_dir: JMethodID,
-    on_content_ready: JMethodID,
-    /// Optional: not all frontends implement this callback.
+    /// Optional: not all frontends implement these callbacks.
+    on_content_ready: Option<JMethodID>,
     on_shared_objects_flushed: Option<JMethodID>,
 }
 
@@ -175,13 +175,11 @@ impl JavaInterface {
     }
 
     pub fn on_content_ready(env: &mut JNIEnv, this: &JObject) {
+        let Some(method) = Self::get().on_content_ready else {
+            return;
+        };
         let result = unsafe {
-            env.call_method_unchecked(
-                this,
-                Self::get().on_content_ready,
-                ReturnType::Primitive(Primitive::Void),
-                &[],
-            )
+            env.call_method_unchecked(this, method, ReturnType::Primitive(Primitive::Void), &[])
         };
         result.expect("onContentReady() must never throw");
     }
@@ -194,6 +192,21 @@ impl JavaInterface {
             env.call_method_unchecked(this, method, ReturnType::Primitive(Primitive::Void), &[])
         };
         result.expect("onSharedObjectsFlushed() must never throw");
+    }
+
+    /// Look up an optional `()V` callback, clearing the pending
+    /// `NoSuchMethodError` that a failed lookup leaves behind.
+    fn optional_void_method(
+        env: &mut JNIEnv,
+        class: &JClass,
+        name: &'static str,
+    ) -> Option<JMethodID> {
+        let id = env.get_method_id(class, name, "()V").ok();
+        if id.is_none() {
+            let _ = env.exception_clear();
+            log::info!("Host does not implement {}(); skipping that callback", name);
+        }
+        id
     }
 
     pub fn init(env: &mut JNIEnv, class: &JClass) {
@@ -222,19 +235,16 @@ impl JavaInterface {
             get_android_data_storage_dir: env
                 .get_method_id(class, "getAndroidDataStorageDir", "()Ljava/lang/String;")
                 .expect("getAndroidDataStorageDir must exist"),
-            on_content_ready: env
-                .get_method_id(class, "onContentReady", "()V")
-                .expect("onContentReady must exist"),
-            on_shared_objects_flushed: {
-                let id = env
-                    .get_method_id(class, "onSharedObjectsFlushed", "()V")
-                    .ok();
-                if id.is_none() {
-                    // get_method_id leaves a pending NoSuchMethodError; clear it.
-                    let _ = env.exception_clear();
-                }
-                id
-            },
+            // These two are optional so a host that predates them still
+            // starts. get_method_id leaves a pending NoSuchMethodError behind
+            // on failure, and jni-rs does not clear it for us -- leaving it
+            // pending would abort on the next JNI call.
+            on_content_ready: Self::optional_void_method(env, class, "onContentReady"),
+            on_shared_objects_flushed: Self::optional_void_method(
+                env,
+                class,
+                "onSharedObjectsFlushed",
+            ),
         });
     }
 }

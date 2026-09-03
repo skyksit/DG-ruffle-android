@@ -51,12 +51,8 @@ backtrace = "0.3.76"
 async-task = "4.7.1"
 
 url = "2.5.2"
-webbrowser = "1.1.0"
 
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"]}
-
-# ✅ 멀티터치 지원: 포인터별 상태 관리
-lazy_static = "1.4"
 
 [features]
 jpegxr = ["ruffle_core/jpegxr"]

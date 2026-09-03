@@ -8,10 +8,12 @@ pub struct AndroidNavigatorInterface;
 
 // TODO: Prompt the user for these things!
 impl NavigatorInterface for AndroidNavigatorInterface {
+    /// Outbound navigation is intentionally disabled: this player is embedded,
+    /// so a SWF must not be able to launch a browser intent. Re-enabling it
+    /// should go through the `ask` prompt the TODO above calls for, not by
+    /// restoring `webbrowser::open` unconditionally.
     fn navigate_to_website(&self, url: Url) {
-        // URL 링크 클릭 시 웹브라우저 열기 비활성화
-        log::info!("URL 네비게이션 차단됨: {}", url);
-        // 웹브라우저를 열지 않음
+        log::info!("Blocked navigation to {}", url);
     }
 
     async fn open_file(&self, path: &Path) -> std::io::Result<File> {
