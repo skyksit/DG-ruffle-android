@@ -101,7 +101,8 @@ private external fun runContextMenuCallback(index: Int)
 private external fun clearContextMenu()
 private external fun setMouseMode(mode: Int)          // 0=direct touch, 1=relative swipe
 private external fun setTouchClickEnabled(enabled: Int)
-private external fun setBackendMode(mode: Int)        // 0=Vulkan preferred, 1=GL only
+private external fun setBackendMode(mode: Int)        // 0=Vulkan (default), 1=OpenGL
+private external fun getActiveBackend(): Int          // 0=Vulkan, 1=OpenGL, -1=not created yet
 private external fun togglePause()
 private external fun isPaused(): Int                  // 1=paused, 0=playing
 private external fun flushSharedObjects()
@@ -119,10 +120,20 @@ companion object {
   `CRASH_CALLBACK_REF` holds a second one. Neither is released until
   `nativeCleanup()` runs, so skipping it leaks the Activity for the life of
   the process.
+- **Renderer backend is a host-facing choice: `0` = Vulkan (default), `1` =
+  OpenGL.** Note this is the opposite of what a `0 = OpenGL` convention would
+  suggest — passing `0` gives Vulkan. The requested backend is honoured exactly
+  (not as a `VULKAN|GL` mask), so "default is Vulkan" holds on every device.
 - **`setBackendMode()` only takes effect before the renderer is built.** It is
   read once, when the player is constructed; later calls are stored (so a
   restart picks them up) and log a warning. Persist the choice yourself if you
   expose it as a setting.
+- **Show `getActiveBackend()`, not the request.** If Vulkan was asked for but
+  cannot initialise (old driver, blocklist, emulator), the renderer falls back
+  to OpenGL rather than aborting, and `getActiveBackend()` then returns `1`
+  while `setBackendMode` was given `0`. A toggle that echoes the request back
+  would tell the user Vulkan is running when it is not. Returns `-1` until the
+  renderer exists.
 - **`flushSharedObjects()` is asynchronous.** It queues the flush; the write
   happens when the event loop next drains. Calling it from `onPause()` and
   then being killed can still lose the save — wait for
@@ -139,8 +150,9 @@ companion object {
 
 - Outbound navigation is disabled: `getURL`/`navigateToURL` are logged and
   ignored rather than opening a browser (`src/navigator.rs`).
-- The default renderer backend is Vulkan with a GL fallback, where upstream
-  hardcodes GL.
+- The renderer backend is selectable (Vulkan by default, OpenGL on request,
+  with an automatic fallback to OpenGL if Vulkan is unavailable), where
+  upstream hardcodes GL.
 - Release builds log at `warn` and above; debug builds are verbose. Note this
   keys off the Cargo profile, and `cargoNdk` builds the release profile even
   for debug APKs.

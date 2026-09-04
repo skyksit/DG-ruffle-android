@@ -11,11 +11,17 @@
 #   ./build-so.sh --abi arm64-v8a          # build one ABI (repeatable)
 #   ./build-so.sh --out <dir>              # write jniLibs tree elsewhere
 #   ./build-so.sh --copy-to <dir>          # also copy into a host app's jniLibs
+#   ./build-so.sh --lib-name <file.so>     # rename output (e.g. libruffle_android_v7.so)
 #   ./build-so.sh --debug                  # cargo debug profile (keeps logging)
 #
 # Environment overrides:
 #   ANDROID_NDK_HOME / ANDROID_NDK_ROOT    NDK location (else autodetected)
 #   API_LEVEL                              defaults to 26, must match host minSdk
+#   LIB_NAME                               same as --lib-name
+#
+# Renaming is safe: the library carries no SONAME, so it resolves by path
+# (System.load) or by filename in jniLibs (System.loadLibrary). The host app
+# picks a versioned core name, e.g. libruffle_android_v7.so.
 #
 set -euo pipefail
 
@@ -30,6 +36,8 @@ REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 OUT_DIR="${REPO_DIR}/dist/jniLibs"
 COPY_TO=""
 PROFILE="release"
+# cargo-ndk always emits libruffle_android.so; this is the name we ship it under.
+LIB_NAME="${LIB_NAME:-libruffle_android.so}"
 API_LEVEL="${API_LEVEL:-26}"
 ABIS=()
 
@@ -38,9 +46,10 @@ while [ $# -gt 0 ]; do
         --abi)      [ $# -ge 2 ] || die "--abi needs a value"; ABIS+=("$2"); shift 2 ;;
         --out)      [ $# -ge 2 ] || die "--out needs a value"; OUT_DIR="$2"; shift 2 ;;
         --copy-to)  [ $# -ge 2 ] || die "--copy-to needs a value"; COPY_TO="$2"; shift 2 ;;
+        --lib-name) [ $# -ge 2 ] || die "--lib-name needs a value"; LIB_NAME="$2"; shift 2 ;;
         --debug)    PROFILE="debug"; shift ;;
         --release)  PROFILE="release"; shift ;;
-        -h|--help)  sed -n '3,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h|--help)  sed -n '3,25p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *)          die "unknown argument: $1" ;;
     esac
 done
@@ -116,7 +125,7 @@ fi
 ok "cargo, cargo-ndk, and targets for ${ABIS[*]} are present"
 
 # --- Build --------------------------------------------------------------------
-step "Building libruffle_android.so (${PROFILE}, API ${API_LEVEL})"
+step "Building ${LIB_NAME} (${PROFILE}, API ${API_LEVEL})"
 
 target_flags=()
 for abi in "${ABIS[@]}"; do
@@ -133,7 +142,19 @@ warn "Building ${#ABIS[@]} ABI(s); a cold build takes several minutes."
 # --- Verify -------------------------------------------------------------------
 step "Verifying output"
 
-SO_NAME="libruffle_android.so"
+BUILT_NAME="libruffle_android.so"
+SO_NAME="$LIB_NAME"
+
+# cargo-ndk names the output after the crate; rename if a different one is asked for.
+if [ "$SO_NAME" != "$BUILT_NAME" ]; then
+    for abi in "${ABIS[@]}"; do
+        if [ -f "${OUT_DIR}/${abi}/${BUILT_NAME}" ]; then
+            mv -f "${OUT_DIR}/${abi}/${BUILT_NAME}" "${OUT_DIR}/${abi}/${SO_NAME}"
+        fi
+    done
+    ok "renamed output to ${SO_NAME}"
+fi
+
 for abi in "${ABIS[@]}"; do
     so_path="${OUT_DIR}/${abi}/${SO_NAME}"
     [ -f "$so_path" ] || die "missing: ${so_path}"
@@ -142,7 +163,7 @@ done
 
 # The host app resolves these lazily, so a missing export is a crash at first
 # call rather than a link error. Check them here instead.
-EXPECTED_SYMBOLS=17
+EXPECTED_SYMBOLS=18
 # Prefer the NDK's llvm-readelf: a stray GNU readelf (e.g. msys2) prints these
 # names in a form the grep below does not match, which would look like a
 # missing-symbol failure when the build is in fact fine.

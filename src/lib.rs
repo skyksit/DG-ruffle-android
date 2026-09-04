@@ -144,13 +144,21 @@ static LAST_MOUSE_POSITION: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 /// Mouse mode: 0 = Direct Touch (absolute), 1 = Relative Swipe (trackpad).
 static MOUSE_MODE: AtomicU8 = AtomicU8::new(0);
 
-/// Backend mode: 0 = Vulkan preferred with GL fallback (default), 1 = GL only.
-/// Only read when the player is constructed; see `set_backend_mode`.
+/// Backend the host asked for: 0 = Vulkan (default), 1 = OpenGL.
+/// Only read when the player is constructed; see `setBackendMode`. If Vulkan
+/// cannot initialise the renderer falls back to OpenGL -- read `ACTIVE_BACKEND`
+/// for what is actually running.
 static BACKEND_MODE: AtomicU8 = AtomicU8::new(0);
 
 /// Set once the renderer has been built, after which `BACKEND_MODE` no longer
 /// has any effect on the running player.
 static BACKEND_LOCKED_IN: AtomicBool = AtomicBool::new(false);
+
+/// The backend actually in use: 0 = Vulkan, 1 = OpenGL, 255 = not yet decided.
+/// May differ from `BACKEND_MODE` when Vulkan was requested but unavailable, so
+/// a host that offers a backend toggle should display this, not the request.
+static ACTIVE_BACKEND: AtomicU8 = AtomicU8::new(BACKEND_UNDECIDED);
+const BACKEND_UNDECIDED: u8 = 255;
 
 /// Per-pointer touch origin and cursor-at-touch-origin, for Relative Swipe
 /// mode. Keyed by `Pointer::pointer_id()`, which is stable for the lifetime of
@@ -182,6 +190,7 @@ fn reset_player_state() {
     lock_poison_tolerant(&MOUSE_POS_AT_TOUCH_STARTS).clear();
     // A new renderer is about to be built, so the backend choice is live again.
     BACKEND_LOCKED_IN.store(false, Ordering::SeqCst);
+    ACTIVE_BACKEND.store(BACKEND_UNDECIDED, Ordering::SeqCst);
 
     // MOUSE_MODE, TOUCH_CLICK_ENABLED and BACKEND_MODE are host *configuration*,
     // not player state, and the host may set them before run() starts (as the
@@ -435,19 +444,22 @@ async fn run(app: AndroidApp) {
                                 let paused = IS_PAUSED.load(Ordering::SeqCst);
                                 player_lock.set_is_playing(!paused);
                             } else {
-                                // Backend mode: 0 = Vulkan preferred (default), 1 = GL only.
-                                // Vulkan is materially faster on modern Android, but it is
-                                // not universally available (old drivers, blocklists, some
-                                // emulators), so mode 0 keeps GL in the mask as a fallback
-                                // rather than turning a missing adapter into an abort.
+                                // Backend mode: 0 = Vulkan (default), 1 = OpenGL.
+                                //
+                                // This is a user-facing choice in the host app, so the
+                                // requested backend is honoured exactly rather than being
+                                // passed as a VULKAN|GL mask -- with a mask wgpu is free to
+                                // pick either adapter, which would make "default = Vulkan"
+                                // untrue on some devices. Vulkan is tried alone, and only a
+                                // genuine initialisation failure falls back to GL.
                                 let backend_mode = BACKEND_MODE.load(Ordering::SeqCst);
                                 BACKEND_LOCKED_IN.store(true, Ordering::SeqCst);
-                                let backend = if backend_mode == 1 {
+                                let requested = if backend_mode == 1 {
                                     wgpu::Backends::GL
                                 } else {
-                                    wgpu::Backends::VULKAN | wgpu::Backends::GL
+                                    wgpu::Backends::VULKAN
                                 };
-                                log::info!("Using backend: {:?}", backend);
+                                log::info!("Requested renderer backend: {:?}", requested);
 
                                 // SurfaceTargetUnsafe is not Clone, so build a fresh
                                 // one per attempt.
@@ -466,30 +478,41 @@ async fn run(app: AndroidApp) {
                                     let attempt = WgpuRenderBackend::for_window_unsafe(
                                         surface_target(),
                                         (dimensions.width, dimensions.height),
-                                        backend,
+                                        requested,
                                         wgpu::PowerPreference::HighPerformance,
                                         None,
                                     );
                                     match attempt {
-                                        Ok(renderer) => renderer,
-                                        Err(e) if backend != wgpu::Backends::GL => {
+                                        Ok(renderer) => {
+                                            ACTIVE_BACKEND.store(backend_mode, Ordering::SeqCst);
+                                            log::info!("Renderer backend in use: {:?}", requested);
+                                            renderer
+                                        }
+                                        Err(e) if requested != wgpu::Backends::GL => {
                                             // Degrade instead of aborting the process: a
                                             // panic here would unwind out of extern "C".
+                                            // The host asked for Vulkan and is not getting
+                                            // it, so say so loudly.
                                             log::warn!(
-                                                "Renderer creation with {backend:?} failed ({e}); retrying with GL only"
+                                                "Vulkan renderer unavailable ({e}); falling back to OpenGL"
                                             );
-                                            WgpuRenderBackend::for_window_unsafe(
+                                            let renderer = WgpuRenderBackend::for_window_unsafe(
                                                 surface_target(),
                                                 (dimensions.width, dimensions.height),
                                                 wgpu::Backends::GL,
                                                 wgpu::PowerPreference::HighPerformance,
                                                 None,
                                             )
-                                            .expect("GL fallback renderer creation failed")
+                                            .expect("OpenGL fallback renderer creation failed");
+                                            ACTIVE_BACKEND.store(1, Ordering::SeqCst);
+                                            log::info!(
+                                                "Renderer backend in use: GL (fell back from Vulkan)"
+                                            );
+                                            renderer
                                         }
                                         Err(e) => {
                                             // edition 2018: panic! takes no implicit args.
-                                            panic!("Renderer creation with {:?} failed: {}", backend, e)
+                                            panic!("OpenGL renderer creation failed: {}", e)
                                         }
                                     }
                                 };
@@ -1162,15 +1185,11 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_setBackendMode(
     _this: JObject,
     mode: jint,
 ) {
-    // mode: 0 = Vulkan preferred (GL fallback), 1 = GL only
+    // mode: 0 = Vulkan (default), 1 = OpenGL
     match mode {
         0 | 1 => {
             BACKEND_MODE.store(mode as u8, Ordering::SeqCst);
-            let name = if mode == 1 {
-                "GL only"
-            } else {
-                "Vulkan preferred"
-            };
+            let name = if mode == 1 { "OpenGL" } else { "Vulkan" };
             if BACKEND_LOCKED_IN.load(Ordering::SeqCst) {
                 // The renderer reads this once, at construction. Storing it is
                 // still worthwhile: a restart in this process picks it up.
@@ -1180,6 +1199,24 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_setBackendMode(
             }
         }
         other => log::warn!("Ignoring unknown backend mode {other}; expected 0 or 1"),
+    }
+}
+
+/// Which backend the renderer actually ended up using.
+///
+/// Returns 0 = Vulkan, 1 = OpenGL, -1 = renderer not created yet. This can
+/// differ from the value passed to `setBackendMode` when Vulkan was requested
+/// but could not initialise, so a host showing a backend toggle should read
+/// this rather than echoing the request back to the user.
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_getActiveBackend(
+    _env: JNIEnv,
+    _this: JObject,
+) -> jint {
+    match ACTIVE_BACKEND.load(Ordering::SeqCst) {
+        BACKEND_UNDECIDED => -1,
+        other => other as jint,
     }
 }
 
