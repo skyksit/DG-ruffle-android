@@ -9,7 +9,7 @@ use custom_event::RuffleEvent;
 
 use jni::{
     objects::{JObject, JString},
-    sys::{self, jint, jobject},
+    sys::{self, jfloatArray, jint, jobject},
     JNIEnv, JavaVM,
 };
 use keycodes::{
@@ -19,7 +19,7 @@ use keycodes::{
 use std::any::Any;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{mpsc, LazyLock, MutexGuard};
 use std::time::Duration;
@@ -42,6 +42,7 @@ use url::Url;
 use ruffle_common::duration::FloatDuration;
 use ruffle_core::{
     backend::navigator::OwnedFuture,
+    backend::ui::MouseCursor,
     events::{LogicalKey, MouseButton, PlayerEvent},
     tag_utils::SwfMovie,
     Player, PlayerBuilder, ViewportDimensions,
@@ -174,6 +175,26 @@ static TOUCH_CLICK_ENABLED: AtomicBool = AtomicBool::new(true);
 /// Pause state: true = paused, false = playing.
 static IS_PAUSED: AtomicBool = AtomicBool::new(false);
 
+/// Cursor position in *View-local* pixels for a host overlay, packed as two f32
+/// bit patterns (x in the high half). `CURSOR_UNKNOWN` = never touched yet.
+///
+/// Mirrored rather than exposing `LAST_MOUSE_POSITION` directly, for two
+/// reasons: that one is in surface-buffer pixels and only the write site knows
+/// the surface/view ratio (the JNI getter cannot reach `native_window`, which
+/// lives on `run()`'s stack), and a getter called from the Java UI thread must
+/// not take a mutex the event-loop thread holds. Reading and writing one
+/// `AtomicU64` also keeps x and y from tearing apart mid-swipe.
+///
+/// `CURSOR_UNKNOWN` is unreachable as a real position: it would need both
+/// halves to be the f32 bit pattern `0xFFFF_FFFF`, a NaN.
+static CURSOR_VIEW_POS: AtomicU64 = AtomicU64::new(CURSOR_UNKNOWN);
+const CURSOR_UNKNOWN: u64 = u64::MAX;
+
+/// Cursor shape Ruffle currently wants: 0 = Arrow, 1 = Hand, 2 = IBeam,
+/// 3 = Grab; `CURSOR_SHAPE_UNKNOWN` before the first tick.
+static CURSOR_SHAPE: AtomicU8 = AtomicU8::new(CURSOR_SHAPE_UNKNOWN);
+const CURSOR_SHAPE_UNKNOWN: u8 = 255;
+
 /// Reset the transient player state that must not leak between `run()` calls.
 ///
 /// The `.so` is never unloaded, so these statics outlive an Activity. Without
@@ -188,6 +209,8 @@ fn reset_player_state() {
     *lock_poison_tolerant(&LAST_MOUSE_POSITION) = None;
     lock_poison_tolerant(&TOUCH_STARTS).clear();
     lock_poison_tolerant(&MOUSE_POS_AT_TOUCH_STARTS).clear();
+    CURSOR_VIEW_POS.store(CURSOR_UNKNOWN, Ordering::SeqCst);
+    CURSOR_SHAPE.store(CURSOR_SHAPE_UNKNOWN, Ordering::SeqCst);
     // A new renderer is about to be built, so the backend choice is live again.
     BACKEND_LOCKED_IN.store(false, Ordering::SeqCst);
     ACTIVE_BACKEND.store(BACKEND_UNDECIDED, Ordering::SeqCst);
@@ -211,6 +234,40 @@ fn last_mouse_position() -> Option<(f64, f64)> {
 
 fn set_last_mouse_position(pos: (f64, f64)) {
     *lock_poison_tolerant(&LAST_MOUSE_POSITION) = Some(pos);
+}
+
+/// Republish the cursor in View-local pixels for `getCursorPosition`.
+///
+/// `surface` is in surface-buffer pixels, the space everything else here uses.
+/// The host draws its overlay in View pixels, and only this site knows both
+/// sizes, so the conversion has to happen here rather than in the getter.
+/// Inverse of the scaling applied to incoming touches.
+fn publish_cursor_view_pos(surface: (f64, f64), surface_size: (i32, i32), view_size: (i32, i32)) {
+    if surface_size.0 <= 0 || surface_size.1 <= 0 {
+        // Surface not laid out yet; keep the previous value rather than
+        // dividing by zero.
+        return;
+    }
+    let x = (surface.0 * view_size.0 as f64 / surface_size.0 as f64) as f32;
+    let y = (surface.1 * view_size.1 as f64 / surface_size.1 as f64) as f32;
+    let packed = ((x.to_bits() as u64) << 32) | y.to_bits() as u64;
+    // Guard the sentinel: only reachable from a NaN pair, but be explicit.
+    let packed = if packed == CURSOR_UNKNOWN { 0 } else { packed };
+    CURSOR_VIEW_POS.store(packed, Ordering::Relaxed);
+}
+
+/// Stable wire values for `MouseCursor`, for `getCursorShape`.
+///
+/// Note Ruffle's names are inverted relative to AS3: `Hand` is AS3
+/// `MouseCursor.BUTTON` (the pointing finger shown over buttons) and `Grab` is
+/// AS3 `MouseCursor.HAND` (the grabbing hand).
+fn cursor_shape_code(cursor: MouseCursor) -> u8 {
+    match cursor {
+        MouseCursor::Arrow => 0,
+        MouseCursor::Hand => 1,
+        MouseCursor::IBeam => 2,
+        MouseCursor::Grab => 3,
+    }
 }
 
 /// Re-send the cursor position to the player.
@@ -687,6 +744,11 @@ async fn run(app: AndroidApp) {
                                         };
 
                                         set_last_mouse_position((mouse_x, mouse_y));
+                                        publish_cursor_view_pos(
+                                            (mouse_x, mouse_y),
+                                            (window.width(), window.height()),
+                                            view_size,
+                                        );
 
                                         // Check if touch click is enabled
                                         let touch_click_enabled = TOUCH_CLICK_ENABLED.load(Ordering::Relaxed);
@@ -936,6 +998,9 @@ async fn run(app: AndroidApp) {
                     audio.recreate_stream_if_needed();
 
                     content_ready = player.is_playing();
+                    // Mirror the shape Ruffle wants while we already hold the
+                    // lock, so getCursorShape() needs neither lock nor player.
+                    CURSOR_SHAPE.store(cursor_shape_code(player.mouse_cursor()), Ordering::Relaxed);
                 }
                 // Deliberately outside the lock above.
                 if content_ready {
@@ -1216,6 +1281,61 @@ pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_getActiveBackend(
 ) -> jint {
     match ACTIVE_BACKEND.load(Ordering::SeqCst) {
         BACKEND_UNDECIDED => -1,
+        other => other as jint,
+    }
+}
+
+/// The virtual cursor position, in View-local pixels, as a `float[2]`.
+///
+/// Returns null until the surface has been touched at least once -- the same
+/// state in which `mousedown`/`mouseup` are dropped. Cannot use a numeric
+/// sentinel: in Direct Touch mode the position is unclamped, so negative and
+/// out-of-range coordinates are legitimate values.
+///
+/// Safe to call from any thread; reads one atomic, takes no lock and makes no
+/// JVM call beyond allocating the result.
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_getCursorPosition(
+    env: JNIEnv,
+    _this: JObject,
+) -> jfloatArray {
+    let packed = CURSOR_VIEW_POS.load(Ordering::Relaxed);
+    if packed == CURSOR_UNKNOWN {
+        return JObject::null().into_raw();
+    }
+    let x = f32::from_bits((packed >> 32) as u32);
+    let y = f32::from_bits(packed as u32);
+
+    // Allocation can fail; a panic here would abort across extern "C".
+    let array = match env.new_float_array(2) {
+        Ok(array) => array,
+        Err(e) => {
+            let _ = env.exception_clear();
+            log::warn!("getCursorPosition: could not allocate result: {e}");
+            return JObject::null().into_raw();
+        }
+    };
+    if let Err(e) = env.set_float_array_region(&array, 0, &[x, y]) {
+        let _ = env.exception_clear();
+        log::warn!("getCursorPosition: could not fill result: {e}");
+        return JObject::null().into_raw();
+    }
+    array.into_raw()
+}
+
+/// The cursor shape Ruffle currently wants: 0 = Arrow, 1 = Hand (over a
+/// button), 2 = IBeam, 3 = Grab; -1 before the first frame.
+///
+/// Safe to call from any thread.
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn Java_rs_ruffle_PlayerActivity_getCursorShape(
+    _env: JNIEnv,
+    _this: JObject,
+) -> jint {
+    match CURSOR_SHAPE.load(Ordering::Relaxed) {
+        CURSOR_SHAPE_UNKNOWN => -1,
         other => other as jint,
     }
 }

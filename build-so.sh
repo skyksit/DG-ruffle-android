@@ -146,7 +146,7 @@ done
 
 # The host app resolves these lazily, so a missing export is a crash at first
 # call rather than a link error. Check them here instead.
-EXPECTED_SYMBOLS=18
+EXPECTED_SYMBOLS=20
 # Prefer the NDK's llvm-readelf: a stray GNU readelf (e.g. msys2) prints these
 # names in a form the grep below does not match, which would look like a
 # missing-symbol failure when the build is in fact fine.

@@ -103,6 +103,8 @@ private external fun setMouseMode(mode: Int)          // 0=direct touch, 1=relat
 private external fun setTouchClickEnabled(enabled: Int)
 private external fun setBackendMode(mode: Int)        // 0=Vulkan (default), 1=OpenGL
 private external fun getActiveBackend(): Int          // 0=Vulkan, 1=OpenGL, -1=not created yet
+private external fun getCursorPosition(): FloatArray? // [x, y] in View px, null=not touched yet
+private external fun getCursorShape(): Int            // 0=Arrow 1=Hand 2=IBeam 3=Grab, -1=no frame yet
 private external fun togglePause()
 private external fun isPaused(): Int                  // 1=paused, 0=playing
 private external fun flushSharedObjects()
@@ -145,6 +147,33 @@ companion object {
 - **Virtual mouse events need a cursor position.** `mousedown`/`mouseup` are
   dropped until the surface has been touched at least once, since there is no
   meaningful place to click before that.
+
+### Drawing a cursor
+
+Nothing is drawn for the virtual cursor. In Relative Swipe mode the finger and
+the cursor are in different places, so a host that uses that mode should draw
+its own pointer. `getCursorPosition()` and `getCursorShape()` exist for this;
+both read a single atomic, take no lock, and are safe from any thread.
+
+- **`getCursorPosition()` returns View-local pixels**, with the origin at the
+  top-left of the SurfaceView whose size `getSurfaceWidth`/`getSurfaceHeight`
+  report. Internally the cursor lives in surface-buffer pixels; the conversion
+  is done natively because only the write site knows the buffer size. If the
+  overlay's parent is not the SurfaceView's parent, add
+  `surfaceView.getLocationInWindow(...)`.
+- **`null` means the surface has never been touched** — exactly the state in
+  which `mousedown`/`mouseup` are dropped. Hide the overlay (and any virtual
+  click buttons) while it is null. A numeric sentinel is deliberately not used:
+  in Direct Touch mode the position is unclamped, so negative and out-of-range
+  coordinates are legitimate. Relative Swipe clamps to the surface bounds.
+- **The position only changes on a touch event.** There is no change callback;
+  poll from a `Choreographer` frame callback. Most frames return the same value.
+- **`getCursorShape()` mirrors what the SWF asks for**, so a `Hand` result means
+  the cursor is over a button or link — worth reflecting in the icon. Beware the
+  naming: Ruffle's `Hand` is AS3 `MouseCursor.BUTTON` (pointing finger) and
+  Ruffle's `Grab` is AS3 `MouseCursor.HAND` (grabbing hand).
+- `flash.ui.Mouse.hide()` is **not** honoured — a SWF that draws its own cursor
+  will show two. Say so if you hit it; supporting it needs a `UiBackend`.
 
 ### Behavioural differences from upstream
 
